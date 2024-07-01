@@ -36,7 +36,7 @@ concurrency:
 env:
   zone: us-west2-a
   # renovate: datasource=github-releases depName=cilium/cilium
-  cilium_version: v1.15.3
+  cilium_version: v1.15.6
   kubectl_version: v1.23.6
   USE_GKE_GCLOUD_AUTH_PLUGIN: True
 
@@ -52,7 +52,7 @@ jobs:
           echo "clusterName=${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_ENV
 
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
 
       - name: Install kubectl
         run: |
@@ -64,7 +64,7 @@ jobs:
 
       - name: Set up gcloud credentials
         id: 'auth'
-        uses: google-github-actions/auth@55bd3a7c6e2ae7cf1877fd1ccb9d54c0503c457c # v2.1.2
+        uses: google-github-actions/auth@71fee32a0bb7e97b4d33d548e7d957010649d8fa # v2.1.3
         with:
           workload_identity_provider: ${{ secrets.GCP_PR_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_PR_SA_CLI }}
@@ -117,7 +117,7 @@ jobs:
             --num-nodes 2 \
             --machine-type e2-custom-2-4096 \
             --disk-type pd-standard \
-            --disk-size 10GB \
+            --disk-size 20GB \
             --node-taints node.cilium.io/agent-not-ready=true:NoExecute \
             --preemptible
           CLUSTER_CIDR=$(gcloud container clusters describe ${{ env.clusterName }} --zone ${{ env.zone }} --format="value(clusterIpv4Cidr)")
@@ -127,55 +127,43 @@ jobs:
         run: |
           gcloud container clusters get-credentials ${{ env.clusterName }} --zone ${{ env.zone }}
 
-      - name: Create gcloud-free kubeconfig and load it in configmap
+      - name: Install Cilium CLI
+        uses: ./
+        with:
+          skip-build: 'true'
+          image-tag: ${{ steps.vars.outputs.sha }}
+
+      - name: Run test
         run: |
-          .github/get-kubeconfig.sh
-          kubectl create configmap cilium-cli-kubeconfig -n kube-system --from-file kubeconfig
+          cilium install \
+          --version "${{ env.cilium_version }}" \
+          --set cluster.name="${{ env.clusterName }}" \
+          --set bpf.monitorAggregation=none \
+          --set loadBalancer.l7.backend=envoy \
+          --set tls.secretsBackend=k8s
 
-      - name: Load test script in configmap
-        run: |
-          kubectl create configmap cilium-cli-test-script -n kube-system --from-file=in-cluster-test-script.sh=.github/in-cluster-test-scripts/gke.sh
+          # Enable Relay
+          cilium hubble enable
 
-      - name: Create cilium-cli job
-        run: |
-          helm install .github/cilium-cli-test-job-chart \
-            --generate-name \
-            --set tag=${{ steps.vars.outputs.sha }} \
-            --set cilium_version=${{ env.cilium_version }} \
-            --set cluster_name=${{ env.clusterName }} \
-            --set cluster_cidr=${{ steps.cluster.outputs.cluster_cidr }}
+          # Wait for cilium and hubble relay to be ready
+          # NB: necessary to work against occassional flakes due to https://github.com/cilium/cilium-cli/issues/918
+          cilium status --wait
 
-      - name: Wait for test job
-        env:
-          timeout: 45m
-        run: |
-          # Background wait for job to complete or timeout
-          kubectl -n kube-system wait job/cilium-cli --for=condition=complete --timeout=${{ env.timeout }} &
-          complete_pid=$!
+          # Port forward Relay
+          cilium hubble port-forward&
+          sleep 10s
+          [[ $(pgrep -f "kubectl.*port-forward.*hubble-relay" | wc -l) == 1 ]]
 
-          # Background wait for job to fail
-          (kubectl -n kube-system wait job/cilium-cli --for=condition=failed --timeout=${{ env.timeout }} && exit 1) &
-          failed_pid=$!
+          # Run connectivity test
+          cilium connectivity test --test-concurrency=5 --all-flows --collect-sysdump-on-failure --external-target google.com.
+          kubectl delete namespace -l "app.kubernetes.io/name=cilium-cli"
 
-          # Active wait for whichever background process ends first
-          wait -n $complete_pid $failed_pid
-          EXIT_CODE=$?
-
-          # Retrieve job logs
-          kubectl logs --timestamps -n kube-system job/cilium-cli
-          exit ${EXIT_CODE}
-        shell: bash {0} # Disable default fail-fast behaviour so that all commands run independently
+          # Run performance test
+          cilium connectivity perf --duration 1s
 
       - name: Post-test information gathering
         if: ${{ !success() }}
         run: |
-          echo "=== Install latest stable CLI ==="
-          curl -sSL --remote-name-all https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz{,.sha256sum}
-          sha256sum --check cilium-linux-amd64.tar.gz.sha256sum
-          sudo tar xzvfC cilium-linux-amd64.tar.gz /usr/bin
-          rm cilium-linux-amd64.tar.gz{,.sha256sum}
-          cilium version
-
           echo "=== Retrieve cluster state ==="
           kubectl get pods --all-namespaces -o wide
           cilium status
@@ -193,7 +181,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: cilium-sysdump-out.zip
           path: cilium-sysdump-out.zip

@@ -34,7 +34,10 @@ const (
 
 	HubbleUIDeploymentName = "hubble-ui"
 
+	HubbleGenerateCertsCronJobName = "hubble-generate-certs"
+
 	ClusterMeshDeploymentName             = "clustermesh-apiserver"
+	ClusterMeshBinaryName                 = "/usr/bin/clustermesh-apiserver"
 	ClusterMeshContainerName              = "apiserver"
 	ClusterMeshPodSelector                = "k8s-app=clustermesh-apiserver"
 	ClusterMeshMetricsPortName            = "apiserv-metrics"
@@ -44,6 +47,7 @@ const (
 	ClusterMeshEtcdMetricsPortName        = "etcd-metrics"
 	ClusterMeshServiceName                = "clustermesh-apiserver"
 	ClusterMeshSecretName                 = "cilium-clustermesh" // Secret which contains the clustermesh configuration
+	ClusterMeshKVStoreMeshSecretName      = "cilium-kvstoremesh" // Secret which contains the kvstoremesh configuration
 	ClusterMeshServerSecretName           = "clustermesh-apiserver-server-cert"
 	ClusterMeshAdminSecretName            = "clustermesh-apiserver-admin-cert"
 	ClusterMeshClientSecretName           = "clustermesh-apiserver-client-cert"
@@ -58,13 +62,15 @@ const (
 	ConnectivityCheckNamespace = "cilium-test"
 
 	// renovate: datasource=docker
-	ConnectivityCheckAlpineCurlImage = "quay.io/cilium/alpine-curl:v1.9.0@sha256:e9f5bd17e6fe42f56d926674624dc915e4d3ff3d3c42f4d9c2f10c72ee9993ff"
+	ConnectivityCheckAlpineCurlImage = "quay.io/cilium/alpine-curl:v1.10.0@sha256:913e8c9f3d960dde03882defa0edd3a919d529c2eb167caa7f54194528bde364"
 	// renovate: datasource=docker
 	ConnectivityPerformanceImage = "quay.io/cilium/network-perf:a816f935930cb2b40ba43230643da4d5751a5711@sha256:679d3a370c696f63884da4557a4466f3b5569b4719bb4f86e8aac02fbe390eea"
 	// renovate: datasource=docker
 	ConnectivityCheckJSONMockImage = "quay.io/cilium/json-mock:v1.3.8@sha256:5aad04835eda9025fe4561ad31be77fd55309af8158ca8663a72f6abb78c2603"
 	// renovate: datasource=docker
 	ConnectivityDNSTestServerImage = "docker.io/coredns/coredns:1.11.1@sha256:1eeb4c7316bacb1d4c8ead65571cd92dd21e27359f0d4917f1a5822a73b75db1"
+	// renovate: datasource=docker
+	ConnectivityTestConnDisruptImage = "quay.io/cilium/test-connection-disruption:v0.0.14@sha256:c3fd56e326ae16f6cb63dbb2e26b4e47ec07a123040623e11399a7fe1196baa0"
 
 	ConfigMapName = "cilium-config"
 
@@ -102,7 +108,7 @@ const (
 
 var (
 	// renovate: datasource=github-releases depName=cilium/cilium
-	Version = "v1.15.3"
+	Version = "v1.15.6"
 
 	// HelmRepository specifies Helm repository to download Cilium charts from.
 	HelmRepository = "https://helm.cilium.io"

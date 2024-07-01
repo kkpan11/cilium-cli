@@ -19,12 +19,12 @@ RELEASE_UID ?= $(shell id -u)
 RELEASE_GID ?= $(shell id -g)
 
 # renovate: datasource=docker depName=golang
-GO_IMAGE_VERSION = 1.22.1-alpine3.19
-GO_IMAGE_SHA = sha256:0466223b8544fb7d4ff04748acc4d75a608234bf4e79563bff208d2060c0dd79
+GO_IMAGE_VERSION = 1.22.4-alpine3.19
+GO_IMAGE_SHA = sha256:c46c4609d3cc74a149347161fc277e11516f523fd8aa6347c9631527da0b7a56
 
 # renovate: datasource=docker depName=golangci/golangci-lint
-GOLANGCILINT_WANT_VERSION = v1.57.2
-GOLANGCILINT_IMAGE_SHA = sha256:8f3a60a00a83bb7d599d2e028ac0c3573dc2b9ec0842590f1c2e59781c821da7
+GOLANGCILINT_WANT_VERSION = v1.59.1
+GOLANGCILINT_IMAGE_SHA = sha256:b5f8712114561f1e2fbe74d04ed07ddfd992768705033a6251f3c7b848eac38e
 GOLANGCILINT_VERSION = $(shell golangci-lint version --format short 2>/dev/null)
 
 $(TARGET):
@@ -38,7 +38,7 @@ release:
 		--rm \
 		--workdir /cilium \
 		--volume `pwd`:/cilium docker.io/library/golang:$(GO_IMAGE_VERSION)@$(GO_IMAGE_SHA) \
-		sh -c "apk add --no-cache setpriv make git && \
+		sh -c "apk add --no-cache setpriv make git zip && \
 			/usr/bin/setpriv --reuid=$(RELEASE_UID) --regid=$(RELEASE_GID) --clear-groups make GOCACHE=/tmp/gocache local-release"
 
 local-release: clean
@@ -64,8 +64,14 @@ local-release: clean
 			env GOOS=$$OS GOARCH=$$ARCH $(GO_BUILD) $(if $(GO_TAGS),-tags $(GO_TAGS)) \
 				-ldflags "$(GO_BUILD_LDFLAGS)" \
 				-o release/$$OS/$$ARCH/$(TARGET)$$EXT ./cmd/cilium; \
-			tar -czf release/$(TARGET)-$$OS-$$ARCH.tar.gz -C release/$$OS/$$ARCH $(TARGET)$$EXT; \
-			(cd release && sha256sum $(TARGET)-$$OS-$$ARCH.tar.gz > $(TARGET)-$$OS-$$ARCH.tar.gz.sha256sum); \
+			if [ $$OS = "windows" ]; \
+			then \
+				zip -j release/$(TARGET)-$$OS-$$ARCH.zip release/$$OS/$$ARCH/$(TARGET)$$EXT; \
+				(cd release && sha256sum $(TARGET)-$$OS-$$ARCH.zip > $(TARGET)-$$OS-$$ARCH.zip.sha256sum); \
+			else \
+				tar -czf release/$(TARGET)-$$OS-$$ARCH.tar.gz -C release/$$OS/$$ARCH $(TARGET)$$EXT; \
+				(cd release && sha256sum $(TARGET)-$$OS-$$ARCH.tar.gz > $(TARGET)-$$OS-$$ARCH.tar.gz.sha256sum); \
+			fi; \
 		done; \
 		rm -rf release/$$OS; \
 	done; \

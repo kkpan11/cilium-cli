@@ -99,7 +99,7 @@ func parseLabelPrefix(label string) (*LabelPrefix, error) {
 
 	r, err := regexp.Compile(labelPrefix.Prefix)
 	if err != nil {
-		return nil, fmt.Errorf("unable to compile regexp: %s", err)
+		return nil, fmt.Errorf("unable to compile regexp: %w", err)
 	}
 	labelPrefix.expr = r
 
@@ -122,7 +122,7 @@ func ParseLabelPrefixCfg(prefixes, nodePrefixes []string, file string) error {
 		log.Infof("Parsing base label prefixes from file %s", file)
 		cfg, err = readLabelPrefixCfgFrom(file)
 		if err != nil {
-			return fmt.Errorf("unable to read label prefix file: %s", err)
+			return fmt.Errorf("unable to read label prefix file: %w", err)
 		}
 
 		fromCustomFile = true
@@ -218,16 +218,19 @@ func defaultLabelPrefixCfg() *labelPrefixCfg {
 		regexp.QuoteMeta(k8sConst.PodNamespaceLabel),                    // include io.kubernetes.pod.namespace
 		regexp.QuoteMeta(k8sConst.PodNamespaceMetaLabels),               // include all namespace labels
 		regexp.QuoteMeta(k8sConst.AppKubernetes),                        // include app.kubernetes.io
+		regexp.QuoteMeta(k8sConst.PolicyLabelCluster),                   // include io.cilium.k8s.policy.cluster
 		`!io\.kubernetes`,                                               // ignore all other io.kubernetes labels
 		`!kubernetes\.io`,                                               // ignore all other kubernetes.io labels
 		"!" + regexp.QuoteMeta(k8sConst.StatefulSetPodNameLabel),        // ignore statefulset.kubernetes.io/pod-name label
 		"!" + regexp.QuoteMeta(k8sConst.StatefulSetPodIndexLabel),       // ignore apps.kubernetes.io/pod-index label
 		"!" + regexp.QuoteMeta(k8sConst.IndexedJobCompletionIndexLabel), // ignore batch.kubernetes.io/job-completion-index label
+		"!" + regexp.QuoteMeta(k8sConst.BatchJobControllerUID),          // ignore batch.kubernetes.io/controller-uid
 		`!.*beta\.kubernetes\.io`,                                       // ignore all beta.kubernetes.io labels
 		`!k8s\.io`,                                                      // ignore all k8s.io labels
 		`!pod-template-generation`,                                      // ignore pod-template-generation
 		`!pod-template-hash`,                                            // ignore pod-template-hash
 		`!controller-revision-hash`,                                     // ignore controller-revision-hash
+		`!controller-uid`,                                               // ignore controller-uid
 		`!annotation.*`,                                                 // ignore all annotation labels
 		`!etcd_node`,                                                    // ignore etcd_node label
 	}

@@ -8,14 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
+	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cilium/cilium/api/v1/models"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/workerpool"
+	"golang.org/x/term"
 	"helm.sh/helm/v3/pkg/action"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -65,12 +67,13 @@ type K8sStatusCollector struct {
 
 type k8sImplementation interface {
 	CiliumStatus(ctx context.Context, namespace, pod string) (*models.StatusResponse, error)
+	KVStoreMeshStatus(ctx context.Context, namespace, pod string) ([]*models.RemoteCluster, error)
 	CiliumDbgEndpoints(ctx context.Context, namespace, pod string) ([]*models.Endpoint, error)
 	GetDaemonSet(ctx context.Context, namespace, name string, options metav1.GetOptions) (*appsv1.DaemonSet, error)
 	GetDeployment(ctx context.Context, namespace, name string, options metav1.GetOptions) (*appsv1.Deployment, error)
 	ListPods(ctx context.Context, namespace string, options metav1.ListOptions) (*corev1.PodList, error)
 	ListCiliumEndpoints(ctx context.Context, namespace string, options metav1.ListOptions) (*ciliumv2.CiliumEndpointList, error)
-	CiliumLogs(ctx context.Context, namespace, pod string, since time.Time, filter *regexp.Regexp) (string, error)
+	CiliumLogs(ctx context.Context, namespace, pod string, since time.Time) (string, error)
 }
 
 func NewK8sStatusCollector(client k8sImplementation, params K8sStatusParameters) (*K8sStatusCollector, error) {
@@ -108,6 +111,26 @@ func (k *K8sStatusCollector) ClusterMeshConnectivity(ctx context.Context, cilium
 
 	c.GlobalServices = status.ClusterMesh.NumGlobalServices
 	for _, cluster := range status.ClusterMesh.Clusters {
+		c.Clusters[cluster.Name] = cluster
+	}
+
+	return c, nil
+}
+
+func (k *K8sStatusCollector) KVStoreMeshConnectivity(ctx context.Context, pod string) (*ClusterMeshAgentConnectivityStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, k.params.waitTimeout())
+	defer cancel()
+
+	c := &ClusterMeshAgentConnectivityStatus{
+		Clusters: map[string]*models.RemoteCluster{},
+	}
+
+	status, err := k.client.KVStoreMeshStatus(ctx, k.params.Namespace, pod)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, cluster := range status {
 		c.Clusters[cluster.Name] = cluster
 	}
 
@@ -341,7 +364,7 @@ func (k *K8sStatusCollector) Status(ctx context.Context) (*Status, error) {
 			if k.params.Output == OutputSummary && k.params.Interactive {
 				statusFmt := s.Format()
 				cursorUp(lines)
-				lines = len(strings.Split(statusFmt, "\n"))
+				lines = countWrappedLines(statusFmt)
 				fmt.Print(statusFmt)
 			}
 			continue
@@ -353,9 +376,21 @@ func (k *K8sStatusCollector) Status(ctx context.Context) (*Status, error) {
 }
 
 func cursorUp(lines int) {
-	for i := 1; i < lines; i++ {
+	for i := 0; i < lines; i++ {
 		fmt.Print("\033[A\033[2K")
 	}
+}
+
+func countWrappedLines(text string) int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		width = 80 // default width if we can't get the terminal size
+	}
+	lines := 1
+	for _, line := range strings.Split(text, "\n") {
+		lines += (utf8.RuneCountInString(line) + width - 1) / width
+	}
+	return lines
 }
 
 type statusTask struct {
@@ -544,10 +579,11 @@ func (k *K8sStatusCollector) status(ctx context.Context) *Status {
 			}
 			status.HelmChartVersion = release.Chart.Metadata.Version
 			return nil
-		}})
+		},
+	})
 
 	// for the sake of sanity, don't get pod logs more than once
-	var agentLogsOnce = sync.Once{}
+	agentLogsOnce := sync.Once{}
 	err := k.podStatus(ctx, status, defaults.AgentDaemonSetName, defaults.AgentPodSelector, func(_ context.Context, status *Status, name string, pod *corev1.Pod) {
 		if pod.Status.Phase == corev1.PodRunning {
 			// extract container status
@@ -591,7 +627,7 @@ func (k *K8sStatusCollector) status(ctx context.Context) *Status {
 									dyingGasp = strings.TrimSpace(terminated.Message)
 								} else {
 									agentLogsOnce.Do(func() { // in a sync.Once so we don't waste time retrieving lots of logs
-										logs, err := k.client.CiliumLogs(ctx, pod.Namespace, pod.Name, terminated.FinishedAt.Time.Add(-2*time.Minute), nil)
+										logs, err := k.client.CiliumLogs(ctx, pod.Namespace, pod.Name, terminated.FinishedAt.Time.Add(-2*time.Minute))
 										if err == nil && logs != "" {
 											dyingGasp = strings.TrimSpace(logs)
 										}
@@ -621,7 +657,6 @@ func (k *K8sStatusCollector) status(ctx context.Context) *Status {
 			})
 		}
 	})
-
 	if err != nil {
 		status.CollectionError(err)
 	}

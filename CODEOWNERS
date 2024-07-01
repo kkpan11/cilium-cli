@@ -17,10 +17,8 @@
 * @cilium/cli
 /CODEOWNERS @cilium/contributing
 /.github/ @cilium/contributing
-/.github/cilium-cli-test-job-chart/ @cilium/github-sec @cilium/ci-structure
 /.github/gcp-vm-startup.sh @cilium/ci-structure
 /.github/get-kubeconfig.sh @cilium/github-sec @cilium/ci-structure
-/.github/in-cluster-test-scripts/ @cilium/ci-structure
 /.github/kind-config*.yaml @cilium/ci-structure
 /.github/tools/ @cilium/ci-structure
 /.github/workflows/ @cilium/github-sec @cilium/ci-structure
@@ -45,9 +43,11 @@
 /connectivity/builder/echo_ingress_mutual_auth_spiffe.go @cilium/sig-servicemesh
 /connectivity/builder/egress_gateway.go @cilium/egress-gateway
 /connectivity/builder/egress_gateway_excluded_cidrs.go @cilium/egress-gateway
+/connectivity/builder/egress_gateway_with_l7_policy.go @cilium/egress-gateway
 /connectivity/builder/no_ipsec_xfrm_errors.go @cilium/sig-encryption
 /connectivity/builder/node_to_node_encryption.go @cilium/sig-encryption
 /connectivity/builder/pod_to_pod_encryption.go @cilium/sig-encryption
+/connectivity/tests/clustermesh-endpointslice-sync.go @cilium/sig-clustermesh
 /connectivity/tests/egressgateway.go @cilium/egress-gateway
 /connectivity/tests/encryption.go @cilium/sig-encryption
 /connectivity/tests/errors.go @cilium/sig-agent @cilium/sig-datapath

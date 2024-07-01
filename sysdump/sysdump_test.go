@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gopkg.in/check.v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -324,6 +325,10 @@ func (c *fakeClient) GetStatefulSet(_ context.Context, _, _ string, _ metav1.Get
 	return nil, nil
 }
 
+func (c *fakeClient) GetCronJob(_ context.Context, _, _ string, _ metav1.GetOptions) (*batchv1.CronJob, error) {
+	return nil, nil
+}
+
 func (c *fakeClient) GetDeployment(_ context.Context, _, _ string, _ metav1.GetOptions) (*appsv1.Deployment, error) {
 	return nil, nil
 }
@@ -340,11 +345,19 @@ func (c *fakeClient) ProxyGet(_ context.Context, namespace, name, url string) (s
 	return fmt.Sprintf("Get from %s/%s/%s", namespace, name, url), nil
 }
 
+func (c *fakeClient) ProxyTCP(_ context.Context, _, _ string, _ uint16, _ func(io.ReadWriteCloser) error) error {
+	panic("implement me")
+}
+
 func (c *fakeClient) GetSecret(_ context.Context, _, _ string, _ metav1.GetOptions) (*corev1.Secret, error) {
 	panic("implement me")
 }
 
 func (c *fakeClient) GetVersion(_ context.Context) (string, error) {
+	panic("implement me")
+}
+
+func (c *fakeClient) GetHelmMetadata(_ context.Context, _ string, _ string) (string, error) {
 	panic("implement me")
 }
 

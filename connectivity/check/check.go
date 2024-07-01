@@ -23,6 +23,7 @@ type Parameters struct {
 	AssumeCiliumVersion   string
 	CiliumNamespace       string
 	TestNamespace         string
+	TestConcurrency       int
 	SingleNode            bool
 	PrintFlows            bool
 	ForceDeploy           bool
@@ -43,34 +44,37 @@ type Parameters struct {
 	SkipIPCacheCheck      bool
 	// Perf is not user-facing parameter, but it's used to run perf subcommand
 	// using connectivity test suite.
-	Perf                  bool
-	PerfReportDir         string
-	PerfDuration          time.Duration
-	PerfHostNet           bool
-	PerfPodNet            bool
-	PerfSamples           int
-	CurlImage             string
-	PerformanceImage      string
-	JSONMockImage         string
-	AgentDaemonSetName    string
-	DNSTestServerImage    string
-	IncludeUnsafeTests    bool
-	AgentPodSelector      string
-	CiliumPodSelector     string
-	NodeSelector          map[string]string
-	DeploymentAnnotations annotationsMap
-	NamespaceAnnotations  annotations
-	ExternalTarget        string
-	ExternalCIDR          string
-	ExternalIP            string
-	ExternalOtherIP       string
-	PodCIDRs              []podCIDRs
-	NodeCIDRs             []string
-	ControlPlaneCIDRs     []string
-	K8sCIDR               string
-	NodesWithoutCiliumIPs []nodesWithoutCiliumIP
-	JunitFile             string
-	JunitProperties       map[string]string
+	Perf                   bool
+	PerfReportDir          string
+	PerfDuration           time.Duration
+	PerfHostNet            bool
+	PerfPodNet             bool
+	PerfSamples            int
+	CurlImage              string
+	PerformanceImage       string
+	JSONMockImage          string
+	TestConnDisruptImage   string
+	AgentDaemonSetName     string
+	DNSTestServerImage     string
+	IncludeUnsafeTests     bool
+	AgentPodSelector       string
+	CiliumPodSelector      string
+	NodeSelector           map[string]string
+	DeploymentAnnotations  annotationsMap
+	NamespaceAnnotations   annotations
+	ExternalTarget         string
+	ExternalCIDR           string
+	ExternalIP             string
+	ExternalDeploymentPort int
+	ExternalOtherIP        string
+	EchoServerHostPort     int
+	PodCIDRs               []podCIDRs
+	NodeCIDRs              []string
+	ControlPlaneCIDRs      []string
+	K8sCIDR                string
+	NodesWithoutCiliumIPs  []nodesWithoutCiliumIP
+	JunitFile              string
+	JunitProperties        map[string]string
 
 	IncludeConnDisruptTest        bool
 	ConnDisruptTestSetup          bool

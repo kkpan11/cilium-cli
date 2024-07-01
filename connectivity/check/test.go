@@ -14,10 +14,6 @@ import (
 	"time"
 
 	"github.com/blang/semver/v4"
-	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
-	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	"github.com/cilium/cilium/pkg/policy/api"
-	"github.com/cilium/cilium/pkg/versioncheck"
 	"github.com/cloudflare/cfssl/cli/genkey"
 	"github.com/cloudflare/cfssl/config"
 	"github.com/cloudflare/cfssl/csr"
@@ -28,6 +24,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
+	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/versioncheck"
 
 	"github.com/cilium/cilium-cli/defaults"
 	"github.com/cilium/cilium-cli/sysdump"
@@ -63,11 +64,11 @@ func NewTest(name string, verbose bool, debug bool) *Test {
 		name:        name,
 		scenarios:   make(map[Scenario][]*Action),
 		cnps:        make(map[string]*ciliumv2.CiliumNetworkPolicy),
+		ccnps:       make(map[string]*ciliumv2.CiliumClusterwideNetworkPolicy),
 		knps:        make(map[string]*networkingv1.NetworkPolicy),
 		cegps:       make(map[string]*ciliumv2.CiliumEgressGatewayPolicy),
-		verbose:     verbose,
+		clrps:       make(map[string]*ciliumv2.CiliumLocalRedirectPolicy),
 		logBuf:      &bytes.Buffer{}, // maintain internal buffer by default
-		warnBuf:     &bytes.Buffer{},
 		conditionFn: func() bool { return true },
 	}
 	// Setting the internal buffer to nil causes the logger to
@@ -122,6 +123,9 @@ type Test struct {
 	// Cilium Egress Gateway Policies active during this test.
 	cegps map[string]*ciliumv2.CiliumEgressGatewayPolicy
 
+	// Cilium Local Redirect Policies active during this test.
+	clrps map[string]*ciliumv2.CiliumLocalRedirectPolicy
+
 	// Secrets that have to be present during the test.
 	secrets map[string]*corev1.Secret
 
@@ -144,10 +148,8 @@ type Test struct {
 
 	// Buffer to store output until it's flushed by a failure.
 	// Unused when run in verbose or debug mode.
-	logMu   sync.RWMutex
-	logBuf  io.ReadWriter
-	warnBuf *bytes.Buffer
-	verbose bool
+	logMu  sync.RWMutex
+	logBuf io.ReadWriter
 
 	// conditionFn is a function that returns true if the test needs to run,
 	// and false otherwise. By default, it's set to a function that returns
@@ -155,7 +157,7 @@ type Test struct {
 	conditionFn func() bool
 
 	// List of functions to be called when Run() returns.
-	finalizers []func() error
+	finalizers []func(ctx context.Context) error
 }
 
 func (t *Test) String() string {
@@ -216,7 +218,7 @@ func (t *Test) setup(ctx context.Context) error {
 			return fmt.Errorf("installing static routes: %w", err)
 		}
 
-		t.finalizers = append(t.finalizers, func() error {
+		t.finalizers = append(t.finalizers, func(context.Context) error {
 			return t.Context().modifyStaticRoutesForNodesWithoutCilium(ctx, "del")
 		})
 	}
@@ -293,7 +295,10 @@ func (t *Test) finalize() {
 	t.Debug("Finalizing Test", t.Name())
 
 	for _, f := range t.finalizers {
-		if err := f(); err != nil {
+		// Use a detached context to make sure this call is not affected by
+		// context cancellation. Usually, finalization (e.g., netpol removal)
+		// needs to happen even when the user interrupted the program.
+		if err := f(context.TODO()); err != nil {
 			t.Failf("Error finalizing '%s': %s", t.Name(), err)
 		}
 	}
@@ -330,7 +335,7 @@ func (t *Test) Run(ctx context.Context, index int) error {
 		t.completionTime = time.Now()
 	}()
 
-	t.ctx.Logf("[=] Test [%s] [%d/%d]", t.Name(), index, len(t.ctx.tests))
+	t.ctx.logger.Printf(t, "[=] [%s] Test [%s] [%d/%d]\n", t.ctx.params.TestNamespace, t.Name(), index, len(t.ctx.tests))
 
 	if err := t.setup(ctx); err != nil {
 		return fmt.Errorf("setting up test: %w", err)
@@ -367,7 +372,7 @@ func (t *Test) Run(ctx context.Context, index int) error {
 	}
 
 	if t.logBuf != nil {
-		fmt.Fprintln(t.ctx.params.Writer)
+		t.ctx.logger.Printf(t, "\n")
 	}
 
 	// Don't add any more code here, as Scenario.Run() can call Fatal() and
@@ -533,6 +538,43 @@ func (t *Test) WithK8SPolicy(policy string) *Test {
 
 	// It is implicit that KNP should be enabled.
 	t.WithFeatureRequirements(features.RequireEnabled(features.KNP))
+
+	return t
+}
+
+// CiliumLocalRedirectPolicyParams is used to configure a CiliumLocalRedirectPolicy template.
+type CiliumLocalRedirectPolicyParams struct {
+	// Policy is the local redirect policy yaml.
+	Policy string
+
+	// Name is the name of the local redirect policy.
+	Name string
+
+	// FrontendIP is the IP address of the address matcher frontend set in the policy spec.
+	FrontendIP string
+
+	// SkipRedirectFromBackend is the flag set in the policy spec.
+	SkipRedirectFromBackend bool
+}
+
+func (t *Test) WithCiliumLocalRedirectPolicy(params CiliumLocalRedirectPolicyParams) *Test {
+	pl, err := parseCiliumLocalRedirectPolicyYAML(params.Policy)
+	if err != nil {
+		t.Fatalf("Parsing local redirect policy YAML: %s", err)
+	}
+
+	for i := range pl {
+		pl[i].Namespace = t.ctx.params.TestNamespace
+		pl[i].Name = params.Name
+		pl[i].Spec.RedirectFrontend.AddressMatcher.IP = params.FrontendIP
+		pl[i].Spec.SkipRedirectFromBackend = params.SkipRedirectFromBackend
+	}
+
+	if err := t.addCLRPs(pl...); err != nil {
+		t.Fatalf("Adding CLRPs to cilium local redirect policy context: %s", err)
+	}
+
+	t.WithFeatureRequirements(features.RequireEnabled(features.LocalRedirectPolicy))
 
 	return t
 }
@@ -791,7 +833,7 @@ func (t *Test) WithSetupFunc(f SetupFunc) *Test {
 }
 
 // WithFinalizer registers a finalizer to be executed when Run() returns.
-func (t *Test) WithFinalizer(f func() error) *Test {
+func (t *Test) WithFinalizer(f func(context.Context) error) *Test {
 	t.finalizers = append(t.finalizers, f)
 	return t
 }
@@ -934,4 +976,8 @@ func (t *Test) CiliumClusterwideNetworkPolicies() map[string]*ciliumv2.CiliumClu
 
 func (t *Test) KubernetesNetworkPolicies() map[string]*networkingv1.NetworkPolicy {
 	return t.knps
+}
+
+func (t *Test) CiliumLocalRedirectPolicies() map[string]*ciliumv2.CiliumLocalRedirectPolicy {
+	return t.clrps
 }

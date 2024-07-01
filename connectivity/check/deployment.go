@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -43,15 +43,19 @@ const (
 
 	DNSTestServerContainerName = "dns-test-server"
 
-	echoSameNodeDeploymentName     = "echo-same-node"
-	echoOtherNodeDeploymentName    = "echo-other-node"
-	echoExternalNodeDeploymentName = "echo-external-node"
-	corednsConfigMapName           = "coredns-configmap"
-	corednsConfigVolumeName        = "coredns-config-volume"
-	kindEchoName                   = "echo"
-	kindEchoExternalNodeName       = "echo-external-node"
-	kindClientName                 = "client"
-	kindPerfName                   = "perf"
+	echoSameNodeDeploymentName                 = "echo-same-node"
+	echoOtherNodeDeploymentName                = "echo-other-node"
+	EchoOtherNodeDeploymentHeadlessServiceName = "echo-other-node-headless"
+	echoExternalNodeDeploymentName             = "echo-external-node"
+	corednsConfigMapName                       = "coredns-configmap"
+	corednsConfigVolumeName                    = "coredns-config-volume"
+	kindEchoName                               = "echo"
+	kindEchoExternalNodeName                   = "echo-external-node"
+	kindClientName                             = "client"
+	kindPerfName                               = "perf"
+	lrpBackendDeploymentName                   = "lrp-backend"
+	lrpClientDeploymentName                    = "lrp-client"
+	kindLrpName                                = "lrp"
 
 	hostNetNSDeploymentName          = "host-netns"
 	hostNetNSDeploymentNameNonCilium = "host-netns-non-cilium" // runs on non-Cilium test nodes
@@ -61,10 +65,12 @@ const (
 	testConnDisruptServerDeploymentName = "test-conn-disrupt-server"
 	testConnDisruptServiceName          = "test-conn-disrupt"
 	KindTestConnDisrupt                 = "test-conn-disrupt"
+)
 
-	EchoServerHostPort = 4000
-
-	IngressServiceName = "ingress-service"
+var (
+	appLabels = map[string]string{
+		"app.kubernetes.io/name": "cilium-cli",
+	}
 )
 
 type deploymentParameters struct {
@@ -79,6 +85,7 @@ type deploymentParameters struct {
 	Affinity                      *corev1.Affinity
 	NodeSelector                  map[string]string
 	ReadinessProbe                *corev1.Probe
+	Resources                     corev1.ResourceRequirements
 	Labels                        map[string]string
 	Annotations                   map[string]string
 	HostNetwork                   bool
@@ -146,6 +153,7 @@ func newDeployment(p deploymentParameters) *appsv1.Deployment {
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         p.Command,
 							ReadinessProbe:  p.ReadinessProbe,
+							Resources:       p.Resources,
 							SecurityContext: &corev1.SecurityContext{
 								Capabilities: &corev1.Capabilities{
 									Add: []corev1.Capability{"NET_RAW"},
@@ -336,10 +344,10 @@ func newLocalReadinessProbe(port int, path string) *corev1.Probe {
 	}
 }
 
-func newIngress() *networkingv1.Ingress {
+func newIngress(name, backend string) *networkingv1.Ingress {
 	return &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: IngressServiceName,
+			Name: name,
 			Annotations: map[string]string{
 				"ingress.cilium.io/loadbalancer-mode": "dedicated",
 				"ingress.cilium.io/service-type":      "NodePort",
@@ -362,7 +370,7 @@ func newIngress() *networkingv1.Ingress {
 									}(),
 									Backend: networkingv1.IngressBackend{
 										Service: &networkingv1.IngressServiceBackend{
-											Name: echoOtherNodeDeploymentName,
+											Name: backend,
 											Port: networkingv1.ServiceBackendPort{
 												Number: 8080,
 											},
@@ -376,6 +384,14 @@ func newIngress() *networkingv1.Ingress {
 			},
 		},
 	}
+}
+
+func (ct *ConnectivityTest) ingresses() map[string]string {
+	ingresses := map[string]string{"same-node": echoSameNodeDeploymentName}
+	if !ct.Params().SingleNode || ct.Params().MultiCluster != "" {
+		ingresses["other-node"] = echoOtherNodeDeploymentName
+	}
+	return ingresses
 }
 
 // deploy ensures the test Namespace, Services and Deployments are running on the cluster.
@@ -399,6 +415,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        ct.params.TestNamespace,
 					Annotations: ct.params.NamespaceAnnotations,
+					Labels:      appLabels,
 				},
 			}
 			_, err = client.CreateNamespace(ctx, namespace, metav1.CreateOptions{})
@@ -430,12 +447,15 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 			testConnDisruptServerDeployment := newDeployment(deploymentParameters{
 				Name:           testConnDisruptServerDeploymentName,
 				Kind:           KindTestConnDisrupt,
-				Image:          "quay.io/cilium/test-connection-disruption:v0.0.13",
+				Image:          ct.params.TestConnDisruptImage,
 				Replicas:       3,
 				Labels:         map[string]string{"app": "test-conn-disrupt-server"},
 				Command:        []string{"tcd-server", "8000"},
 				Port:           8000,
 				ReadinessProbe: readinessProbe,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI)},
+				},
 			})
 			_, err = ct.clients.src.CreateServiceAccount(ctx, ct.params.TestNamespace, k8s.NewServiceAccount(testConnDisruptServerDeploymentName), metav1.CreateOptions{})
 			if err != nil {
@@ -482,15 +502,18 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 			testConnDisruptClientDeployment := newDeployment(deploymentParameters{
 				Name:     testConnDisruptClientDeploymentName,
 				Kind:     KindTestConnDisrupt,
-				Image:    "quay.io/cilium/test-connection-disruption:v0.0.13",
+				Image:    ct.params.TestConnDisruptImage,
 				Replicas: 5,
 				Labels:   map[string]string{"app": "test-conn-disrupt-client"},
 				Command: []string{
 					"tcd-client",
-					"--dispatch-interval", strconv.Itoa(int(ct.params.ConnDisruptDispatchInterval.Milliseconds())),
+					"--dispatch-interval", ct.params.ConnDisruptDispatchInterval.String(),
 					fmt.Sprintf("test-conn-disrupt.%s.svc.cluster.local.:8000", ct.params.TestNamespace),
 				},
 				ReadinessProbe: readinessProbe,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI)},
+				},
 			})
 
 			_, err = ct.clients.dst.CreateServiceAccount(ctx, ct.params.TestNamespace, k8s.NewServiceAccount(testConnDisruptClientDeploymentName), metav1.CreateOptions{})
@@ -516,14 +539,29 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 
 	if ct.params.MultiCluster != "" {
 		_, err = ct.clients.src.GetService(ctx, ct.params.TestNamespace, echoOtherNodeDeploymentName, metav1.GetOptions{})
+		svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080)
+		svc.ObjectMeta.Annotations = map[string]string{}
+		svc.ObjectMeta.Annotations["service.cilium.io/global"] = "true"
+		svc.ObjectMeta.Annotations["io.cilium/global-service"] = "true"
+
 		if err != nil {
 			ct.Logf("✨ [%s] Deploying %s service...", ct.clients.src.ClusterName(), echoOtherNodeDeploymentName)
-			svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080)
-			svc.ObjectMeta.Annotations = map[string]string{}
-			svc.ObjectMeta.Annotations["service.cilium.io/global"] = "true"
-			svc.ObjectMeta.Annotations["io.cilium/global-service"] = "true"
-
 			_, err = ct.clients.src.CreateService(ctx, ct.params.TestNamespace, svc, metav1.CreateOptions{})
+			if err != nil {
+				return err
+			}
+		}
+
+		_, err = ct.clients.src.GetService(ctx, ct.params.TestNamespace, EchoOtherNodeDeploymentHeadlessServiceName, metav1.GetOptions{})
+		svcHeadless := svc.DeepCopy()
+		svcHeadless.Name = EchoOtherNodeDeploymentHeadlessServiceName
+		svcHeadless.Spec.ClusterIP = corev1.ClusterIPNone
+		svcHeadless.Spec.Type = corev1.ServiceTypeClusterIP
+		svcHeadless.ObjectMeta.Annotations["service.cilium.io/global-sync-endpoint-slices"] = "true"
+
+		if err != nil {
+			ct.Logf("✨ [%s] Deploying %s service...", ct.clients.src.ClusterName(), EchoOtherNodeDeploymentHeadlessServiceName)
+			_, err = ct.clients.src.CreateService(ctx, ct.params.TestNamespace, svcHeadless, metav1.CreateOptions{})
 			if err != nil {
 				return err
 			}
@@ -532,7 +570,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 
 	hostPort := 0
 	if ct.Features[features.HostPort].Enabled {
-		hostPort = EchoServerHostPort
+		hostPort = ct.Params().EchoServerHostPort
 	}
 	dnsConfigMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -732,19 +770,35 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 	if !ct.params.SingleNode || ct.params.MultiCluster != "" {
 
 		_, err = ct.clients.dst.GetService(ctx, ct.params.TestNamespace, echoOtherNodeDeploymentName, metav1.GetOptions{})
+		svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080)
+		if ct.params.MultiCluster != "" {
+			svc.ObjectMeta.Annotations = map[string]string{}
+			svc.ObjectMeta.Annotations["service.cilium.io/global"] = "true"
+			svc.ObjectMeta.Annotations["io.cilium/global-service"] = "true"
+		}
+
 		if err != nil {
-			ct.Logf("✨ [%s] Deploying echo-other-node service...", ct.clients.dst.ClusterName())
-			svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080)
-
-			if ct.params.MultiCluster != "" {
-				svc.ObjectMeta.Annotations = map[string]string{}
-				svc.ObjectMeta.Annotations["service.cilium.io/global"] = "true"
-				svc.ObjectMeta.Annotations["io.cilium/global-service"] = "true"
-			}
-
+			ct.Logf("✨ [%s] Deploying %s service...", ct.clients.dst.ClusterName(), echoOtherNodeDeploymentName)
 			_, err = ct.clients.dst.CreateService(ctx, ct.params.TestNamespace, svc, metav1.CreateOptions{})
 			if err != nil {
 				return err
+			}
+		}
+
+		if ct.params.MultiCluster != "" {
+			svcHeadless := svc.DeepCopy()
+			svcHeadless.Name = EchoOtherNodeDeploymentHeadlessServiceName
+			svcHeadless.Spec.ClusterIP = corev1.ClusterIPNone
+			svcHeadless.Spec.Type = corev1.ServiceTypeClusterIP
+			svcHeadless.ObjectMeta.Annotations["service.cilium.io/global-sync-endpoint-slices"] = "true"
+			_, err = ct.clients.dst.GetService(ctx, ct.params.TestNamespace, EchoOtherNodeDeploymentHeadlessServiceName, metav1.GetOptions{})
+
+			if err != nil {
+				ct.Logf("✨ [%s] Deploying %s service...", ct.clients.dst.ClusterName(), EchoOtherNodeDeploymentHeadlessServiceName)
+				_, err = ct.clients.dst.CreateService(ctx, ct.params.TestNamespace, svcHeadless, metav1.CreateOptions{})
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -835,18 +889,19 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 			_, err = ct.clients.src.GetDeployment(ctx, ct.params.TestNamespace, echoExternalNodeDeploymentName, metav1.GetOptions{})
 			if err != nil {
 				ct.Logf("✨ [%s] Deploying echo-external-node deployment...", ct.clients.src.ClusterName())
-				containerPort := 8080
+				// in case if test concurrency is > 1 port must be unique for each test namespace
+				port := ct.Params().ExternalDeploymentPort
 				echoExternalDeployment := newDeployment(deploymentParameters{
 					Name:           echoExternalNodeDeploymentName,
 					Kind:           kindEchoExternalNodeName,
-					Port:           containerPort,
-					NamedPort:      "http-8080",
-					HostPort:       8080,
+					Port:           port,
+					NamedPort:      fmt.Sprintf("http-%d", port),
+					HostPort:       port,
 					Image:          ct.params.JSONMockImage,
 					Labels:         map[string]string{"external": "echo"},
 					Annotations:    ct.params.DeploymentAnnotations.Match(echoExternalNodeDeploymentName),
 					NodeSelector:   map[string]string{"cilium.io/no-schedule": "true"},
-					ReadinessProbe: newLocalReadinessProbe(containerPort, "/"),
+					ReadinessProbe: newLocalReadinessProbe(port, "/"),
 					HostNetwork:    true,
 					Tolerations: []corev1.Toleration{
 						{Operator: corev1.TolerationOpExists},
@@ -860,6 +915,16 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 				if err != nil {
 					return fmt.Errorf("unable to create deployment %s: %s", echoExternalNodeDeploymentName, err)
 				}
+
+				svc := newService(echoExternalNodeDeploymentName,
+					map[string]string{"name": echoExternalNodeDeploymentName, "kind": kindEchoExternalNodeName},
+					map[string]string{"kind": kindEchoExternalNodeName}, "http", 8080)
+				svc.Spec.ClusterIP = corev1.ClusterIPNone
+				svc.Spec.Type = corev1.ServiceTypeClusterIP
+				_, err := ct.clients.src.CreateService(ctx, ct.params.TestNamespace, svc, metav1.CreateOptions{})
+				if err != nil {
+					return fmt.Errorf("unable to create service %s: %w", echoExternalNodeDeploymentName, err)
+				}
 			}
 		} else {
 			ct.Infof("Skipping tests that require a node Without Cilium")
@@ -868,15 +933,74 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 
 	// Create one Ingress service for echo deployment
 	if ct.Features[features.IngressController].Enabled {
-		_, err = ct.clients.src.GetIngress(ctx, ct.params.TestNamespace, IngressServiceName, metav1.GetOptions{})
-		if err != nil {
-			ct.Logf("✨ [%s] Deploying Ingress resource...", ct.clients.src.ClusterName())
-			_, err = ct.clients.src.CreateIngress(ctx, ct.params.TestNamespace, newIngress(), metav1.CreateOptions{})
+		for name, backend := range ct.ingresses() {
+			_, err = ct.clients.src.GetIngress(ctx, ct.params.TestNamespace, name, metav1.GetOptions{})
 			if err != nil {
-				return err
+				ct.Logf("✨ [%s] Deploying Ingress resource...", ct.clients.src.ClusterName())
+				_, err = ct.clients.src.CreateIngress(ctx, ct.params.TestNamespace, newIngress(name, backend), metav1.CreateOptions{})
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
+
+	if ct.Features[features.LocalRedirectPolicy].Enabled {
+		ct.Logf("✨ [%s] Deploying lrp-client deployment...", ct.clients.src.ClusterName())
+		lrpClientDeployment := newDeployment(deploymentParameters{
+			Name:         lrpClientDeploymentName,
+			Kind:         kindLrpName,
+			Image:        ct.params.CurlImage,
+			Command:      []string{"/usr/bin/pause"},
+			Labels:       map[string]string{"lrp": "client"},
+			Annotations:  ct.params.DeploymentAnnotations.Match(lrpClientDeploymentName),
+			NodeSelector: ct.params.NodeSelector,
+		})
+		_, err = ct.clients.src.CreateServiceAccount(ctx, ct.params.TestNamespace, k8s.NewServiceAccount(lrpClientDeploymentName), metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to create service account %s: %s", lrpClientDeployment, err)
+		}
+		_, err = ct.clients.src.CreateDeployment(ctx, ct.params.TestNamespace, lrpClientDeployment, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to create deployment %s: %s", lrpClientDeployment, err)
+		}
+		ct.Logf("✨ [%s] Deploying lrp-backend deployment...", ct.clients.src.ClusterName())
+		containerPort := 8080
+		lrpBackendDeployment := newDeployment(deploymentParameters{
+			Name:           lrpBackendDeploymentName,
+			Kind:           kindLrpName,
+			Image:          ct.params.JSONMockImage,
+			NamedPort:      "tcp-8080",
+			Port:           containerPort,
+			ReadinessProbe: newLocalReadinessProbe(containerPort, "/"),
+			Labels:         map[string]string{"lrp": "backend"},
+			Annotations:    ct.params.DeploymentAnnotations.Match(lrpBackendDeploymentName),
+			Affinity: &corev1.Affinity{
+				PodAffinity: &corev1.PodAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+						{
+							LabelSelector: &metav1.LabelSelector{
+								MatchExpressions: []metav1.LabelSelectorRequirement{
+									{Key: "name", Operator: metav1.LabelSelectorOpIn, Values: []string{lrpClientDeploymentName}},
+								},
+							},
+							TopologyKey: corev1.LabelHostname,
+						},
+					},
+				},
+			},
+			NodeSelector: ct.params.NodeSelector,
+		})
+		_, err = ct.clients.src.CreateServiceAccount(ctx, ct.params.TestNamespace, k8s.NewServiceAccount(lrpBackendDeploymentName), metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to create service account %s: %s", lrpBackendDeployment, err)
+		}
+		_, err = ct.clients.src.CreateDeployment(ctx, ct.params.TestNamespace, lrpBackendDeployment, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to create deployment %s: %s", lrpBackendDeployment, err)
+		}
+	}
+
 	return nil
 }
 
@@ -1030,6 +1154,11 @@ func (ct *ConnectivityTest) deploymentList() (srcList []string, dstList []string
 		srcList = append(srcList, echoExternalNodeDeploymentName)
 	}
 
+	if ct.Features[features.LocalRedirectPolicy].Enabled {
+		srcList = append(srcList, lrpClientDeploymentName)
+		srcList = append(srcList, lrpBackendDeploymentName)
+	}
+
 	return srcList, dstList
 }
 
@@ -1047,6 +1176,7 @@ func (ct *ConnectivityTest) deleteDeployments(ctx context.Context, client *k8s.C
 	_ = client.DeleteServiceAccount(ctx, ct.params.TestNamespace, client3DeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteService(ctx, ct.params.TestNamespace, echoSameNodeDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteService(ctx, ct.params.TestNamespace, echoOtherNodeDeploymentName, metav1.DeleteOptions{})
+	_ = client.DeleteService(ctx, ct.params.TestNamespace, EchoOtherNodeDeploymentHeadlessServiceName, metav1.DeleteOptions{})
 	_ = client.DeleteConfigMap(ctx, ct.params.TestNamespace, corednsConfigMapName, metav1.DeleteOptions{})
 	_ = client.DeleteNamespace(ctx, ct.params.TestNamespace, metav1.DeleteOptions{})
 
@@ -1066,7 +1196,7 @@ func (ct *ConnectivityTest) deleteDeployments(ctx context.Context, client *k8s.C
 }
 
 func (ct *ConnectivityTest) DeleteConnDisruptTestDeployment(ctx context.Context, client *k8s.Client) error {
-	ct.Logf("🔥 [%s] Deleting test-conn-disrupt deployments...", client.ClusterName())
+	ct.Debugf("🔥 [%s] Deleting test-conn-disrupt deployments...", client.ClusterName())
 	_ = client.DeleteDeployment(ctx, ct.params.TestNamespace, testConnDisruptClientDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteDeployment(ctx, ct.params.TestNamespace, testConnDisruptServerDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteServiceAccount(ctx, ct.params.TestNamespace, testConnDisruptClientDeploymentName, metav1.DeleteOptions{})
@@ -1122,6 +1252,28 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 			return ct.perfClientPods[i].Pod.Name < ct.perfClientPods[j].Pod.Name
 		})
 		return nil
+	}
+
+	if ct.Features[features.LocalRedirectPolicy].Enabled {
+		lrpPods, err := ct.client.ListPods(ctx, ct.params.TestNamespace, metav1.ListOptions{LabelSelector: "kind=" + kindLrpName})
+		if err != nil {
+			return fmt.Errorf("unable to list lrp pods: %w", err)
+		}
+		for _, lrpPod := range lrpPods.Items {
+			if v, hasLabel := lrpPod.GetLabels()["lrp"]; hasLabel {
+				if v == "backend" {
+					ct.lrpBackendPods[lrpPod.Name] = Pod{
+						K8sClient: ct.client,
+						Pod:       lrpPod.DeepCopy(),
+					}
+				} else if v == "client" {
+					ct.lrpClientPods[lrpPod.Name] = Pod{
+						K8sClient: ct.client,
+						Pod:       lrpPod.DeepCopy(),
+					}
+				}
+			}
+		}
 	}
 
 	clientPods, err := ct.client.ListPods(ctx, ct.params.TestNamespace, metav1.ListOptions{LabelSelector: "kind=" + kindClientName})
@@ -1192,7 +1344,18 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 				K8sClient: ct.client,
 				Pod:       pod.DeepCopy(),
 				scheme:    "http",
-				port:      8080, // listen port of the echo server inside the container
+				port:      uint32(ct.Params().ExternalDeploymentPort), // listen port of the echo server inside the container
+			}
+		}
+
+		echoExternalServices, err := ct.clients.dst.ListServices(ctx, ct.params.TestNamespace, metav1.ListOptions{LabelSelector: "kind=" + kindEchoExternalNodeName})
+		if err != nil {
+			return fmt.Errorf("unable to list echo external services: %w", err)
+		}
+
+		for _, echoExternalService := range echoExternalServices.Items {
+			ct.echoExternalServices[echoExternalService.Name] = Service{
+				Service: echoExternalService.DeepCopy(),
 			}
 		}
 	}
@@ -1272,13 +1435,15 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 	}
 
 	if ct.Features[features.IngressController].Enabled {
-		svcName := fmt.Sprintf("cilium-ingress-%s", IngressServiceName)
-		svc, err := WaitForServiceRetrieval(ctx, ct, ct.client, ct.params.TestNamespace, svcName)
-		if err != nil {
-			return err
-		}
+		for name := range ct.ingresses() {
+			svcName := fmt.Sprintf("cilium-ingress-%s", name)
+			svc, err := WaitForServiceRetrieval(ctx, ct, ct.client, ct.params.TestNamespace, svcName)
+			if err != nil {
+				return err
+			}
 
-		ct.ingressService[svcName] = svc
+			ct.ingressService[svcName] = svc
+		}
 	}
 
 	if ct.params.MultiCluster == "" {

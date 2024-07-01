@@ -19,9 +19,14 @@ table](https://github.com/cilium/cilium-cli#releases) for the most recent suppor
 Set `RELEASE` environment variable to the new version. This variable will be
 used in the commands throughout the documenat to allow copy-pasting.
 
-    export RELEASE=v0.16.5
+    export RELEASE=v0.16.12
 
-## Prepare the release
+## Update local checkout
+
+Update your local checkout to the latest state:
+
+    git checkout main
+    git pull origin main
 
 ### Update the README.md
 
@@ -35,7 +40,7 @@ it can be copy-pasted when preparing the next release.
     git checkout -b pr/prepare-$RELEASE
     git add README.md RELEASE.md
     git commit -s -m "Prepare for $RELEASE release"
-    git push origin HEAD
+    git push origin pr/prepare-$RELEASE
 
 Then open a pull request against `main` branch. Wait for the PR to be reviewed and merged.
 

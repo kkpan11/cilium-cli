@@ -24,4 +24,22 @@ const (
 
 	// PeerLogField is used as key for BGP peer in the log field.
 	PeerLogField = "peer"
+
+	// FamilyLogField is used as key for BGP peer address family in the log field.
+	FamilyLogField = "family"
+
+	// PathLogField is used as key for BGP path in the log field.
+	PathLogField = "path"
+
+	// PrefixLogField is used as key for BGP prefix in the log field.
+	PrefixLogField = "prefix"
+
+	// AdvertTypeLogField is used as key for BGP advertisement type in the log field.
+	AdvertTypeLogField = "advertisement_type"
+
+	// PodIPPoolLogField is used as key for Pod IP pool in the log field.
+	PodIPPoolLogField = "pod_ip_pool"
+
+	// PolicyLogField is used as key for BGP policy in the log field.
+	PolicyLogField = "policy"
 )

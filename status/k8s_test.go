@@ -5,8 +5,8 @@ package status
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"regexp"
 	"testing"
 	"time"
 
@@ -144,7 +144,7 @@ func (c *k8sStatusMockClient) ListCiliumEndpoints(_ context.Context, _ string, o
 	return c.ciliumEndpointList[options.LabelSelector], nil
 }
 
-func (c *k8sStatusMockClient) CiliumLogs(_ context.Context, _, _ string, _ time.Time, _ *regexp.Regexp) (string, error) {
+func (c *k8sStatusMockClient) CiliumLogs(_ context.Context, _, _ string, _ time.Time) (string, error) {
 	return "[error] a sample cilium-agent error message", nil
 }
 
@@ -154,6 +154,10 @@ func (c *k8sStatusMockClient) CiliumStatus(_ context.Context, _, pod string) (*m
 		return nil, fmt.Errorf("pod %s not found", pod)
 	}
 	return s, nil
+}
+
+func (c *k8sStatusMockClient) KVStoreMeshStatus(_ context.Context, _, _ string) ([]*models.RemoteCluster, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (c *k8sStatusMockClient) CiliumDbgEndpoints(_ context.Context, _, _ string) ([]*models.Endpoint, error) {

@@ -9,6 +9,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/google/gops/signal"
+
 	"github.com/cilium/cilium-cli/defaults"
 )
 
@@ -33,6 +35,7 @@ const (
 	hubbleRelayContainerName           = defaults.RelayContainerName
 	hubbleRelayDeploymentName          = defaults.RelayDeploymentName
 	hubbleUIDeploymentName             = defaults.HubbleUIDeploymentName
+	hubbleGenerateCertsCronJob         = defaults.HubbleGenerateCertsCronJobName
 	spireServerContainerName           = "spire-server"
 	redacted                           = "XXXXXX"
 )
@@ -71,15 +74,13 @@ const (
 	ciliumNodesFileName                      = "ciliumnodes-<ts>.yaml"
 	ciliumNodeConfigsFileName                = "ciliumnodeconfigs-<ts>.yaml"
 	ciliumOperatorDeploymentFileName         = "cilium-operator-deployment-<ts>.yaml"
-	ciliumOperatorPodMetricsFileName         = "cilium-operator-pod-%s-metrics-<ts>.yaml"
 	ciliumPodIPPoolsFileName                 = "ciliumpodippools-<ts>.yaml"
 	clustermeshApiserverDeploymentFileName   = "clustermesh-apiserver-deployment-<ts>.yaml"
-	clustermeshEtcdMetricsFileName           = "cilium-clustermesh-etcd-%s-metrics-<ts>.yaml"
-	clustermeshMetricsFileName               = "clustermesh-apiserver-%s-metrics-<ts>.yaml"
-	clustermeshKVStoreMeshMetricsFileName    = "clustermesh-kvstoremesh-%s-metrics-<ts>.yaml"
+	metricsFileName                          = "metrics-%s-%s-<ts>.txt"
 	cniConfigMapFileName                     = "cni-configmap-<ts>.yaml"
 	cniConfigFileName                        = "cniconf-%s-%s-<ts>.txt"
 	eniconfigsFileName                       = "aws-eniconfigs-<ts>.yaml"
+	ciliumHelmMetadataFileName               = "cilium-helm-metadata-<ts>.yaml"
 	ciliumHelmValuesFileName                 = "cilium-helm-values-<ts>.yaml"
 	gopsFileName                             = "gops-%s-%s-<ts>-%s.txt"
 	hubbleDaemonsetFileName                  = "hubble-daemonset-<ts>.yaml"
@@ -88,6 +89,8 @@ const (
 	hubbleRelayConfigMapFileName             = "hubble-relay-configmap-<ts>.yaml"
 	hubbleRelayDeploymentFileName            = "hubble-relay-deployment-<ts>.yaml"
 	hubbleUIDeploymentFileName               = "hubble-ui-deployment-<ts>.yaml"
+	hubbleGenerateCertsCronJobFileName       = "hubble-generate-certs-cronjob-<ts>.yaml"
+	hubbleCertificatesFileName               = "hubble-certificates-<ts>.yaml"
 	kubernetesEndpointsFileName              = "k8s-endpoints-<ts>.yaml"
 	kubernetesEventsFileName                 = "k8s-events-<ts>.yaml"
 	kubernetesEventsTableFileName            = "k8s-events-<ts>.html"
@@ -148,11 +151,17 @@ var (
 		"stack",
 		"stats",
 	}
-	gopsProfiling = []string{
-		"pprof-heap",
-		"pprof-cpu",
+	gopsProfiling = map[string]byte{
+		"pprof-heap": signal.HeapProfile,
+		"pprof-cpu":  signal.CPUProfile,
 	}
 	gopsTrace = "trace"
+
+	certificate = schema.GroupVersionResource{
+		Group:    "cert-manager.io",
+		Resource: "certificates",
+		Version:  "v1",
+	}
 
 	// Gateway API resource group versions used for sysdumping these
 	gatewayClass = schema.GroupVersionResource{

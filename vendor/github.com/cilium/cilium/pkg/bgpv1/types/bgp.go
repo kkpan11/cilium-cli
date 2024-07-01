@@ -33,6 +33,7 @@ type Path struct {
 	// read/write
 	NLRI           bgp.AddrPrefixInterface
 	PathAttributes []bgp.PathAttributeInterface
+	Family         Family // can be empty, in which case it will be inferred from NLRI
 
 	// readonly
 	AgeNanoseconds int64 // time duration in nanoseconds since the Path was created
@@ -179,7 +180,8 @@ type RoutePolicy struct {
 
 // RoutePolicyRequest contains parameters for adding or removing a routing policy.
 type RoutePolicyRequest struct {
-	Policy *RoutePolicy
+	DefaultExportAction RoutePolicyAction
+	Policy              *RoutePolicy
 }
 
 // GetPeerStateResponse contains state of peers configured in given instance
@@ -201,6 +203,10 @@ type ServerParameters struct {
 type Family struct {
 	Afi  Afi
 	Safi Safi
+}
+
+func (f Family) String() string {
+	return f.Afi.String() + "-" + f.Safi.String()
 }
 
 // Route represents a single route in the RIB of underlying router

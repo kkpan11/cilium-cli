@@ -50,24 +50,29 @@ type ConnectivityTest struct {
 	// Parameters to the test suite, specified by the CLI user.
 	params Parameters
 
+	logger *ConcurrentLogger
+
 	// version is the version string of the cilium-cli itself
 	version string
 
 	// Clients for source and destination clusters.
 	clients *deploymentClients
 
-	ciliumPods        map[string]Pod
-	echoPods          map[string]Pod
-	echoExternalPods  map[string]Pod
-	clientPods        map[string]Pod
-	clientCPPods      map[string]Pod
-	perfClientPods    []Pod
-	perfServerPod     []Pod
-	PerfResults       []common.PerfSummary
-	echoServices      map[string]Service
-	ingressService    map[string]Service
-	k8sService        Service
-	externalWorkloads map[string]ExternalWorkload
+	ciliumPods           map[string]Pod
+	echoPods             map[string]Pod
+	echoExternalPods     map[string]Pod
+	clientPods           map[string]Pod
+	clientCPPods         map[string]Pod
+	perfClientPods       []Pod
+	perfServerPod        []Pod
+	PerfResults          []common.PerfSummary
+	echoServices         map[string]Service
+	echoExternalServices map[string]Service
+	ingressService       map[string]Service
+	k8sService           Service
+	externalWorkloads    map[string]ExternalWorkload
+	lrpClientPods        map[string]Pod
+	lrpBackendPods       map[string]Pod
 
 	hostNetNSPodsByNode      map[string]Pod
 	secondaryNetworkNodeIPv4 map[string]string // node name => secondary ip
@@ -186,7 +191,7 @@ func (ct *ConnectivityTest) failedActions() []*Action {
 }
 
 // NewConnectivityTest returns a new ConnectivityTest.
-func NewConnectivityTest(client *k8s.Client, p Parameters, version string) (*ConnectivityTest, error) {
+func NewConnectivityTest(client *k8s.Client, p Parameters, version string, logger *ConcurrentLogger) (*ConnectivityTest, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
@@ -194,16 +199,20 @@ func NewConnectivityTest(client *k8s.Client, p Parameters, version string) (*Con
 	k := &ConnectivityTest{
 		client:                   client,
 		params:                   p,
+		logger:                   logger,
 		version:                  version,
 		ciliumPods:               make(map[string]Pod),
 		echoPods:                 make(map[string]Pod),
 		echoExternalPods:         make(map[string]Pod),
 		clientPods:               make(map[string]Pod),
 		clientCPPods:             make(map[string]Pod),
+		lrpClientPods:            make(map[string]Pod),
+		lrpBackendPods:           make(map[string]Pod),
 		perfClientPods:           []Pod{},
 		perfServerPod:            []Pod{},
 		PerfResults:              []common.PerfSummary{},
 		echoServices:             make(map[string]Service),
+		echoExternalServices:     make(map[string]Service),
 		ingressService:           make(map[string]Service),
 		externalWorkloads:        make(map[string]ExternalWorkload),
 		hostNetNSPodsByNode:      make(map[string]Pod),
@@ -271,6 +280,9 @@ type SetupHooks interface {
 // Cilium. This must be run before Run() is called.
 func (ct *ConnectivityTest) SetupAndValidate(ctx context.Context, extra SetupHooks) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ct.detectSingleNode(ctx); err != nil {
 		return err
 	}
 	if err := ct.initClients(ctx); err != nil {
@@ -348,6 +360,19 @@ func (ct *ConnectivityTest) SetupAndValidate(ctx context.Context, extra SetupHoo
 	return extra.SetupAndValidate(ctx, ct)
 }
 
+// PrintTestInfo prints connectivity test names and count.
+func (ct *ConnectivityTest) PrintTestInfo() {
+	if len(ct.tests) == 0 {
+		return
+	}
+	ct.Debugf("[%s] Registered connectivity tests", ct.params.TestNamespace)
+	for _, t := range ct.tests {
+		ct.Debugf("  %s", t)
+	}
+	// Newline denoting start of test output.
+	ct.Logf("🏃[%s] Running %d tests ...", ct.params.TestNamespace, len(ct.tests))
+}
+
 // Run kicks off execution of all Tests registered to the ConnectivityTest.
 // Each Test's Run() method is called within its own goroutine.
 func (ct *ConnectivityTest) Run(ctx context.Context) error {
@@ -355,14 +380,9 @@ func (ct *ConnectivityTest) Run(ctx context.Context) error {
 		return err
 	}
 
-	ct.Debug("Registered connectivity tests:")
-	for _, t := range ct.tests {
-		ct.Debugf("  %s", t)
+	if len(ct.tests) == 0 {
+		return nil
 	}
-
-	// Newline denoting start of test output.
-	ct.Logf("🏃 Running %d tests ...", len(ct.tests))
-
 	// Execute all tests in the order they were registered by the test suite.
 	for i, t := range ct.tests {
 		if err := ctx.Err(); err != nil {
@@ -372,12 +392,15 @@ func (ct *ConnectivityTest) Run(ctx context.Context) error {
 		done := make(chan bool)
 
 		go func() {
-			defer func() { done <- true }()
+			defer func() {
+				ct.logger.FinishTest(t)
+				done <- true
+			}()
 
 			if err := t.Run(ctx, i+1); err != nil {
 				// We know for sure we're inside a separate goroutine, so Fatal()
 				// is safe and will properly record failure statistics.
-				t.Fatalf("Running test %s: %s", t.Name(), err)
+				t.Fatalf("[%s] test %s failed: %s", ct.params.TestNamespace, t.Name(), err)
 			}
 
 			// Exit immediately if context was cancelled.
@@ -387,7 +410,7 @@ func (ct *ConnectivityTest) Run(ctx context.Context) error {
 
 			// Pause after each test run if requested by the user.
 			if duration := ct.PostTestSleepDuration(); duration != time.Duration(0) {
-				ct.Infof("Pausing for %s after test %s", duration, t)
+				ct.Infof("[%s] Pausing for %s after test %s", ct.params.TestNamespace, duration, t)
 				time.Sleep(duration)
 			}
 		}()
@@ -395,7 +418,14 @@ func (ct *ConnectivityTest) Run(ctx context.Context) error {
 		// Waiting for the goroutine to finish before starting another Test.
 		<-done
 	}
+	return nil
+}
 
+// PrintReport print connectivity test instance run report.
+func (ct *ConnectivityTest) PrintReport(ctx context.Context) error {
+	if len(ct.tests) == 0 {
+		return nil
+	}
 	if err := ct.writeJunit(); err != nil {
 		ct.Failf("writing to junit file %s failed: %s", ct.Params().JunitFile, err)
 	}
@@ -419,25 +449,21 @@ func (ct *ConnectivityTest) Run(ctx context.Context) error {
 
 		wg.Wait()
 	}
-
-	// Delete conn disrupt pods after running tests. Otherwise, after calling
-	// --flush-ct they might get into crashloop state from which it takes time
-	// to recover, which makes subsequent tests to fail.
-	if ct.Params().IncludeConnDisruptTest && !ct.Params().ConnDisruptTestSetup {
-		for _, client := range ct.Clients() {
-			if err := ct.DeleteConnDisruptTestDeployment(ctx, client); err != nil {
-				return err
-			}
-		}
-	}
-
 	// Report the test results.
 	return ct.report()
 }
 
+// Cleanup cleans test related fields.
+// So, ConnectivityTest instance can be re-used.
+func (ct *ConnectivityTest) Cleanup() {
+	ct.testNames = make(map[string]struct{})
+	ct.tests = make([]*Test, 0)
+	ct.lastFlowTimestamps = make(map[string]time.Time)
+}
+
 // skip marks the Test as skipped.
 func (ct *ConnectivityTest) skip(t *Test, index int, reason string) {
-	ct.Logf("[=] Skipping Test [%s] [%d/%d] (%s)", t.Name(), index, len(t.ctx.tests), reason)
+	ct.logger.Printf(t, "[=] [%s] Skipping test [%s] [%d/%d] (%s)\n", ct.params.TestNamespace, t.Name(), index, len(t.ctx.tests), reason)
 	t.skipped = true
 }
 
@@ -532,7 +558,7 @@ func (ct *ConnectivityTest) report() error {
 	nf := len(failed)
 
 	if nf > 0 {
-		ct.Header("📋 Test Report")
+		ct.Header(fmt.Sprintf("📋 Test Report [%s]", ct.params.TestNamespace))
 
 		// There are failed tests, fetch all failed actions.
 		fa := len(ct.failedActions())
@@ -547,11 +573,11 @@ func (ct *ConnectivityTest) report() error {
 			}
 		}
 
-		return fmt.Errorf("%d tests failed", nf)
+		return fmt.Errorf("[%s] %d tests failed", ct.params.TestNamespace, nf)
 	}
 
 	if ct.params.Perf {
-		ct.Header("🔥 Network Performance Test Summary:")
+		ct.Header(fmt.Sprintf("🔥 Network Performance Test Summary [%s]:", ct.params.TestNamespace))
 		ct.Logf("%s", strings.Repeat("-", 200))
 		ct.Logf("📋 %-15s | %-10s | %-15s | %-15s | %-15s | %-15s | %-15s | %-15s | %-15s | %-15s | %-15s", "Scenario", "Node", "Test", "Duration", "Min", "Mean", "Max", "P50", "P90", "P99", "Transaction rate OP/s")
 		ct.Logf("%s", strings.Repeat("-", 200))
@@ -599,7 +625,7 @@ func (ct *ConnectivityTest) report() error {
 		}
 	}
 
-	ct.Headerf("✅ All %d tests (%d actions) successful, %d tests skipped, %d scenarios skipped.", nt-nst, na, nst, nss)
+	ct.Headerf("✅ [%s] All %d tests (%d actions) successful, %d tests skipped, %d scenarios skipped.", ct.params.TestNamespace, nt-nst, na, nst, nss)
 
 	return nil
 }
@@ -607,10 +633,7 @@ func (ct *ConnectivityTest) report() error {
 func (ct *ConnectivityTest) enableHubbleClient(ctx context.Context) error {
 	ct.Log("🔭 Enabling Hubble telescope...")
 
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	c, err := grpc.DialContext(dialCtx, ct.params.HubbleServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	c, err := grpc.NewClient(ct.params.HubbleServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
@@ -630,10 +653,21 @@ func (ct *ConnectivityTest) enableHubbleClient(ctx context.Context) error {
 			ct.Fail("In --flow-validation=strict mode, Hubble must be available to validate flows")
 			return fmt.Errorf("hubble is not available: %w", err)
 		}
-	} else {
-		ct.Infof("Hubble is OK, flows: %d/%d", status.NumFlows, status.MaxFlows)
+		return nil
 	}
 
+	for status.GetNumUnavailableNodes().GetValue() > 0 {
+		ct.Infof("Waiting for %d nodes to become available: %s",
+			status.GetNumUnavailableNodes().GetValue(), status.GetUnavailableNodes())
+		time.Sleep(5 * time.Second)
+		status, err = ct.hubbleClient.ServerStatus(ctx, &observer.ServerStatusRequest{})
+		if err != nil {
+			ct.Fail("Not all nodes became available to Hubble Relay: %w", err)
+			return fmt.Errorf("not all nodes became available to Hubble Relay: %w", err)
+		}
+	}
+	ct.Infof("Hubble is OK, flows: %d/%d, connected nodes: %d, unavailable nodes %d",
+		status.NumFlows, status.MaxFlows, status.GetNumConnectedNodes().GetValue(), status.GetNumUnavailableNodes().GetValue())
 	return nil
 }
 
@@ -780,65 +814,91 @@ func (ct *ConnectivityTest) modifyStaticRoutesForNodesWithoutCilium(ctx context.
 	return nil
 }
 
-// initClients checks if Cilium is installed on the cluster, whether the cluster
-// has multiple nodes, and whether or not monitor aggregation is enabled.
-// TODO(timo): Split this up, it does a lot.
+// multiClusterClientLock protects K8S client instantiation (Scheme registration)
+// for the cluster mesh setup in case of connectivity test concurrency > 1
+var multiClusterClientLock = sync.Mutex{}
+
+// determine if only single node tests can be ran.
+// if the user specified SingleNode on the CLI this is taken as the truth and
+// we simply return.
+//
+// otherwise, list nodes and check for NoSchedule taints, as long as we have > 1
+// schedulable nodes we will run multi-node tests.
+func (ct *ConnectivityTest) detectSingleNode(ctx context.Context) error {
+
+	if ct.params.MultiCluster != "" && ct.params.SingleNode {
+		return fmt.Errorf("single-node test can not be enabled with multi-cluster test")
+	}
+
+	// single node explicitly defined by user.
+	if ct.params.SingleNode {
+		return nil
+	}
+
+	// only detect single node for single cluster environments
+	if ct.params.MultiCluster != "" {
+		return nil
+	}
+
+	daemonSet, err := ct.client.GetDaemonSet(ctx, ct.params.CiliumNamespace, ct.params.AgentDaemonSetName, metav1.GetOptions{})
+	if err != nil {
+		ct.Fatal("Unable to determine status of Cilium DaemonSet. Run \"cilium status\" for more details")
+		return fmt.Errorf("unable to determine status of Cilium DaemonSet: %w", err)
+	}
+
+	if daemonSet.Status.DesiredNumberScheduled == 1 {
+		ct.params.SingleNode = true
+		return nil
+	}
+
+	nodes, err := ct.client.ListNodes(ctx, metav1.ListOptions{})
+	if err != nil {
+		ct.Fatal("Unable to list nodes.")
+		return fmt.Errorf("unable to list nodes: %w", err)
+	}
+
+	numWorkerNodes := len(nodes.Items)
+	for _, n := range nodes.Items {
+		for _, t := range n.Spec.Taints {
+			switch {
+			case (t.Key == "node-role.kubernetes.io/master" && t.Effect == "NoSchedule"):
+				numWorkerNodes--
+			case (t.Key == "node-role.kubernetes.io/control-plane" && t.Effect == "NoSchedule"):
+				numWorkerNodes--
+			}
+		}
+	}
+
+	ct.params.SingleNode = numWorkerNodes == 1
+	if ct.params.SingleNode {
+		ct.Info("Single-node environment detected, enabling single-node connectivity test")
+	}
+
+	return nil
+}
+
+// initClients assigns the k8s clients used for connectivity tests.
+// in the event that this is a multi-cluster test scenario the destination k8s
+// client is set to the cluster provided in the MultiCluster parameter.
 func (ct *ConnectivityTest) initClients(ctx context.Context) error {
 	c := &deploymentClients{
 		src: ct.client,
 		dst: ct.client,
 	}
 
-	if ct.params.MultiCluster != "" && ct.params.SingleNode {
-		return fmt.Errorf("single-node test can not be enabled with multi-cluster test")
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
-	// In single-cluster environment, automatically detect a single-node
-	// environment so we can skip deploying tests which depend on multiple
-	// nodes.
-	if ct.params.MultiCluster == "" && !ct.params.SingleNode {
-		daemonSet, err := ct.client.GetDaemonSet(ctx, ct.params.CiliumNamespace, ct.params.AgentDaemonSetName, metav1.GetOptions{})
-		if err != nil {
-			ct.Fatal("Unable to determine status of Cilium DaemonSet. Run \"cilium status\" for more details")
-			return fmt.Errorf("unable to determine status of Cilium DaemonSet: %w", err)
-		}
-
-		isSingleNode := false
-		if daemonSet.Status.DesiredNumberScheduled == 1 {
-			isSingleNode = true
-		} else {
-			nodes, err := ct.client.ListNodes(ctx, metav1.ListOptions{})
-			if err != nil {
-				ct.Fatal("Unable to list nodes.")
-				return fmt.Errorf("unable to list nodes: %w", err)
-			}
-
-			numWorkerNodes := len(nodes.Items)
-			for _, n := range nodes.Items {
-				for _, t := range n.Spec.Taints {
-					// cannot schedule connectivity test pods on
-					// master node.
-					if t.Key == "node-role.kubernetes.io/master" {
-						numWorkerNodes--
-					}
-				}
-			}
-
-			isSingleNode = numWorkerNodes == 1
-		}
-
-		if isSingleNode {
-			ct.Info("Single-node environment detected, enabling single-node connectivity test")
-			ct.params.SingleNode = true
-		}
-	} else if ct.params.MultiCluster != "" {
+	if ct.params.MultiCluster != "" {
+		multiClusterClientLock.Lock()
+		defer multiClusterClientLock.Unlock()
 		dst, err := k8s.NewClient(ct.params.MultiCluster, "", ct.params.CiliumNamespace)
 		if err != nil {
 			return fmt.Errorf("unable to create Kubernetes client for remote cluster %q: %w", ct.params.MultiCluster, err)
 		}
 
 		c.dst = dst
-
 	}
 
 	ct.clients = c
@@ -852,6 +912,9 @@ func (ct *ConnectivityTest) initCiliumPods(ctx context.Context) error {
 		ciliumPods, err := client.ListPods(ctx, ct.params.CiliumNamespace, metav1.ListOptions{LabelSelector: ct.params.AgentPodSelector})
 		if err != nil {
 			return fmt.Errorf("unable to list Cilium pods: %w", err)
+		}
+		if len(ciliumPods.Items) == 0 {
+			return fmt.Errorf("no cilium agent pods found in -n %s -l %s", ct.params.CiliumNamespace, ct.params.AgentPodSelector)
 		}
 		for _, ciliumPod := range ciliumPods.Items {
 			// TODO: Can Cilium pod names collide across clusters?
@@ -919,33 +982,6 @@ func (ct *ConnectivityTest) DetectMinimumCiliumVersion(ctx context.Context) (*se
 	}
 
 	return minVersion, nil
-}
-
-// UninstallResources deletes all k8s resources created by the connectivity tests.
-func (ct *ConnectivityTest) UninstallResources(ctx context.Context, wait bool) {
-	ct.Logf("🔥 Deleting pods in %s namespace...", ct.params.TestNamespace)
-	ct.client.DeletePodCollection(ctx, ct.params.TestNamespace, metav1.DeleteOptions{}, metav1.ListOptions{})
-
-	ct.Logf("🔥 Deleting %s namespace...", ct.params.TestNamespace)
-	ct.client.DeleteNamespace(ctx, ct.params.TestNamespace, metav1.DeleteOptions{})
-
-	// If test Pods are not deleted prior to uninstalling Cilium then the CNI deletes
-	// may be queued by cilium-cni. This can cause error to be logged when re-installing
-	// Cilium later.
-	// Thus we wait for all cilium-test Pods to fully terminate before proceeding.
-	if wait {
-		ct.Logf("⌛ Waiting for %s namespace to be terminated...", ct.params.TestNamespace)
-		for {
-			// Wait for the test namespace to be terminated. Subsequent connectivity checks would fail
-			// if the test namespace is in Terminating state.
-			_, err := ct.client.GetNamespace(ctx, ct.params.TestNamespace, metav1.GetOptions{})
-			if err == nil {
-				time.Sleep(defaults.WaitRetryInterval)
-			} else {
-				break
-			}
-		}
-	}
 }
 
 func (ct *ConnectivityTest) CurlCommand(peer TestPeer, ipFam features.IPFamily, opts ...string) []string {
@@ -1027,7 +1063,7 @@ func (ct *ConnectivityTest) CurlCommandParallelWithOutput(peer TestPeer, ipFam f
 	return cmd
 }
 
-func (ct *ConnectivityTest) PingCommand(peer TestPeer, ipFam features.IPFamily) []string {
+func (ct *ConnectivityTest) PingCommand(peer TestPeer, ipFam features.IPFamily, extraArgs ...string) []string {
 	cmd := []string{"ping", "-c", "1"}
 
 	if ipFam == features.IPFamilyV6 {
@@ -1038,7 +1074,10 @@ func (ct *ConnectivityTest) PingCommand(peer TestPeer, ipFam features.IPFamily) 
 		cmd = append(cmd, "-W", strconv.FormatFloat(connectTimeout, 'f', -1, 64))
 	}
 
+	cmd = append(cmd, extraArgs...)
+
 	cmd = append(cmd, peer.Address(ipFam))
+
 	return cmd
 }
 
@@ -1046,6 +1085,17 @@ func (ct *ConnectivityTest) DigCommand(peer TestPeer, ipFam features.IPFamily) [
 	cmd := []string{"dig", "+time=2", "kubernetes"}
 
 	cmd = append(cmd, fmt.Sprintf("@%s", peer.Address(ipFam)))
+	return cmd
+}
+
+func (ct *ConnectivityTest) DigCommandService(peer TestPeer, ipFam features.IPFamily) []string {
+	cmd := []string{"dig"}
+	if ipFam == features.IPFamilyV4 {
+		cmd = append(cmd, "A")
+	} else if ipFam == features.IPFamilyV6 {
+		cmd = append(cmd, "AAAA")
+	}
+	cmd = append(cmd, "+time=2", peer.Name())
 	return cmd
 }
 
@@ -1108,8 +1158,32 @@ func (ct *ConnectivityTest) EchoPods() map[string]Pod {
 	return ct.echoPods
 }
 
+func (ct *ConnectivityTest) LrpClientPods() map[string]Pod {
+	return ct.lrpClientPods
+}
+
+func (ct *ConnectivityTest) LrpBackendPods() map[string]Pod {
+	return ct.lrpBackendPods
+}
+
+// EchoServices returns all the non headless services
 func (ct *ConnectivityTest) EchoServices() map[string]Service {
+	svcs := map[string]Service{}
+	for name, svc := range ct.echoServices {
+		if svc.Service.Spec.ClusterIP == corev1.ClusterIPNone {
+			continue
+		}
+		svcs[name] = svc
+	}
+	return svcs
+}
+
+func (ct *ConnectivityTest) EchoServicesAll() map[string]Service {
 	return ct.echoServices
+}
+
+func (ct *ConnectivityTest) EchoExternalServices() map[string]Service {
+	return ct.echoExternalServices
 }
 
 func (ct *ConnectivityTest) ExternalEchoPods() map[string]Pod {

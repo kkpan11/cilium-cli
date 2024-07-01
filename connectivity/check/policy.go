@@ -10,17 +10,19 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	flowpb "github.com/cilium/cilium/api/v1/flow"
-	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	"github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/scheme"
 	networkingv1 "k8s.io/api/networking/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	clientsetscheme "k8s.io/client-go/kubernetes/scheme"
+
+	flowpb "github.com/cilium/cilium/api/v1/flow"
+	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/scheme"
 
 	"github.com/cilium/cilium-cli/defaults"
 	"github.com/cilium/cilium-cli/k8s"
@@ -209,6 +211,23 @@ func createOrUpdateCEGP(ctx context.Context, client *k8s.Client, cegp *ciliumv2.
 	return err
 }
 
+// createOrUpdateCLRP creates the CLRP and updates it if it already exists.
+func createOrUpdateCLRP(ctx context.Context, client *k8s.Client, clrp *ciliumv2.CiliumLocalRedirectPolicy) error {
+	_, err := CreateOrUpdatePolicy(ctx, client.CiliumClientset.CiliumV2().CiliumLocalRedirectPolicies(clrp.Namespace),
+		clrp, func(current *ciliumv2.CiliumLocalRedirectPolicy) bool {
+			if maps.Equal(current.GetLabels(), clrp.GetLabels()) &&
+				current.Spec.DeepEqual(&clrp.Spec) {
+				return false
+			}
+
+			current.ObjectMeta.Labels = clrp.ObjectMeta.Labels
+			current.Spec = clrp.Spec
+			return true
+		},
+	)
+	return err
+}
+
 // deleteCNP deletes a CiliumNetworkPolicy from the cluster.
 func deleteCNP(ctx context.Context, client *k8s.Client, cnp *ciliumv2.CiliumNetworkPolicy) error {
 	if err := client.DeleteCiliumNetworkPolicy(ctx, cnp.Namespace, cnp.Name, metav1.DeleteOptions{}); err != nil {
@@ -245,6 +264,15 @@ func deleteCEGP(ctx context.Context, client *k8s.Client, cegp *ciliumv2.CiliumEg
 	return nil
 }
 
+// deleteCLRP deletes a CiliumLocalRedirectPolicy from the cluster.
+func deleteCLRP(ctx context.Context, client *k8s.Client, clrp *ciliumv2.CiliumLocalRedirectPolicy) error {
+	if err := client.DeleteCiliumLocalRedirectPolicy(ctx, clrp.Namespace, clrp.Name, metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("%s/%s/%s policy delete failed: %w", client.ClusterName(), clrp.Namespace, clrp.Name, err)
+	}
+
+	return nil
+}
+
 func defaultDropReason(flow *flowpb.Flow) bool {
 	return flow.GetDropReasonDesc() != flowpb.DropReason_DROP_REASON_UNKNOWN
 }
@@ -260,120 +288,6 @@ func defaultDenyReason(flow *flowpb.Flow) bool {
 func authRequiredDropReason(flow *flowpb.Flow) bool {
 	return flow.GetDropReasonDesc() == flowpb.DropReason_AUTH_REQUIRED
 }
-
-var (
-	// ResultNone expects a successful command, don't match any packets.
-	ResultNone = Result{
-		None: true,
-	}
-
-	// ResultOK expects a successful command and a matching flow.
-	ResultOK = Result{}
-
-	// ResultDNSOK expects a successful command, only generating DNS traffic.
-	ResultDNSOK = Result{
-		DNSProxy: true,
-	}
-
-	// ResultDNSOKDropCurlTimeout expects a failed command, generating DNS traffic and a dropped flow.
-	ResultDNSOKDropCurlTimeout = Result{
-		DNSProxy:       true,
-		Drop:           true,
-		DropReasonFunc: defaultDropReason,
-		ExitCode:       ExitCurlTimeout,
-	}
-
-	// ResultDNSOKDropCurlHTTPError expects a failed command, generating DNS traffic and a dropped flow.
-	ResultDNSOKDropCurlHTTPError = Result{
-		DNSProxy:       true,
-		L7Proxy:        true,
-		Drop:           true,
-		DropReasonFunc: defaultDropReason,
-		ExitCode:       ExitCurlHTTPError,
-	}
-
-	// ResultCurlHTTPError expects a failed command, but no dropped flow or DNS proxy.
-	ResultCurlHTTPError = Result{
-		L7Proxy:        true,
-		Drop:           false,
-		DropReasonFunc: defaultDropReason,
-		ExitCode:       ExitCurlHTTPError,
-	}
-
-	// ResultDrop expects a dropped flow and a failed command.
-	ResultDrop = Result{
-		Drop:           true,
-		ExitCode:       ExitAnyError,
-		DropReasonFunc: defaultDropReason,
-	}
-
-	// ResultDropAuthRequired expects a dropped flow with auth required as reason.
-	ResultDropAuthRequired = Result{
-		Drop:           true,
-		DropReasonFunc: authRequiredDropReason,
-	}
-
-	// ResultAnyReasonEgressDrop expects a dropped flow at Egress and a failed command.
-	ResultAnyReasonEgressDrop = Result{
-		Drop:           true,
-		DropReasonFunc: defaultDropReason,
-		EgressDrop:     true,
-		ExitCode:       ExitAnyError,
-	}
-
-	// ResultPolicyDenyEgressDrop expects a dropped flow at Egress due to policy deny and a failed command.
-	ResultPolicyDenyEgressDrop = Result{
-		Drop:           true,
-		DropReasonFunc: policyDenyReason,
-		EgressDrop:     true,
-		ExitCode:       ExitAnyError,
-	}
-
-	// ResultDefaultDenyEgressDrop expects a dropped flow at Egress due to default deny and a failed command.
-	ResultDefaultDenyEgressDrop = Result{
-		Drop:           true,
-		DropReasonFunc: defaultDenyReason,
-		EgressDrop:     true,
-		ExitCode:       ExitAnyError,
-	}
-
-	// ResultIngressAnyReasonDrop expects a dropped flow at Ingress and a failed command.
-	ResultIngressAnyReasonDrop = Result{
-		Drop:           true,
-		IngressDrop:    true,
-		DropReasonFunc: defaultDropReason,
-		ExitCode:       ExitAnyError,
-	}
-
-	// ResultPolicyDenyIngressDrop expects a dropped flow at Ingress due to policy deny reason and a failed command.
-	ResultPolicyDenyIngressDrop = Result{
-		Drop:           true,
-		IngressDrop:    true,
-		DropReasonFunc: policyDenyReason,
-		ExitCode:       ExitAnyError,
-	}
-
-	// ResultDefaultDenyIngressDrop expects a dropped flow at Ingress due to default deny reason and a failed command.
-	ResultDefaultDenyIngressDrop = Result{
-		Drop:           true,
-		IngressDrop:    true,
-		DropReasonFunc: defaultDenyReason,
-		ExitCode:       ExitAnyError,
-	}
-
-	// ResultDropCurlTimeout expects a dropped flow and a failed command.
-	ResultDropCurlTimeout = Result{
-		Drop:     true,
-		ExitCode: ExitCurlTimeout,
-	}
-
-	// ResultDropCurlHTTPError expects a dropped flow and a failed command.
-	ResultDropCurlHTTPError = Result{
-		L7Proxy:  true,
-		Drop:     true,
-		ExitCode: ExitCurlHTTPError,
-	}
-)
 
 type ExpectationsFunc func(a *Action) (egress, ingress Result)
 
@@ -446,6 +360,11 @@ func (t *Test) addCEGPs(cegps ...*ciliumv2.CiliumEgressGatewayPolicy) (err error
 	return err
 }
 
+func (t *Test) addCLRPs(clrps ...*ciliumv2.CiliumLocalRedirectPolicy) (err error) {
+	t.clrps, err = RegisterPolicy(t.clrps, clrps...)
+	return err
+}
+
 func sumMap(m map[string]int) int {
 	sum := 0
 	for _, v := range m {
@@ -454,11 +373,18 @@ func sumMap(m map[string]int) int {
 	return sum
 }
 
+// policyApplyDeleteLock guarantees that only one connectivity test instance
+// can apply or delete policies in case of connectivity test concurrency > 1
+var policyApplyDeleteLock = sync.Mutex{}
+
 // applyPolicies applies all the Test's registered network policies.
 func (t *Test) applyPolicies(ctx context.Context) error {
-	if len(t.cnps) == 0 && len(t.ccnps) == 0 && len(t.knps) == 0 && len(t.cegps) == 0 {
+	if len(t.cnps) == 0 && len(t.ccnps) == 0 && len(t.knps) == 0 && len(t.cegps) == 0 && len(t.clrps) == 0 {
 		return nil
 	}
+
+	policyApplyDeleteLock.Lock()
+	defer policyApplyDeleteLock.Unlock()
 
 	// Get current policy revisions in all Cilium pods.
 	revisions, err := t.Context().getCiliumPolicyRevisions(ctx)
@@ -524,14 +450,21 @@ func (t *Test) applyPolicies(ctx context.Context) error {
 		}
 	}
 
+	// Apply all given Cilium Local Redirect Policies.
+	for _, clrp := range t.clrps {
+		for _, client := range t.Context().clients.clients() {
+			t.Infof("📜 Applying CiliumLocalRedirectPolicy '%s' to namespace '%s'..", clrp.Name, clrp.Namespace)
+			if err := createOrUpdateCLRP(ctx, client, clrp); err != nil {
+				return fmt.Errorf("policy application failed: %w", err)
+			}
+		}
+	}
+
 	// Register a finalizer with the Test immediately to enable cleanup.
 	// If we return a cleanup closure from this function, cleanup cannot be
 	// performed if the user cancels during the policy revision wait time.
-	t.finalizers = append(t.finalizers, func() error {
-		// Use a detached context to make sure this call is not affected by
-		// context cancellation. This deletion needs to happen event when the
-		// user interrupted the program.
-		if err := t.deletePolicies(context.TODO()); err != nil {
+	t.finalizers = append(t.finalizers, func(ctx context.Context) error {
+		if err := t.deletePolicies(ctx); err != nil {
 			t.CiliumLogs(ctx)
 			return err
 		}
@@ -565,14 +498,21 @@ func (t *Test) applyPolicies(ctx context.Context) error {
 		t.Debugf("📜 Successfully applied %d CiliumEgressGatewayPolicies", len(t.cegps))
 	}
 
+	if len(t.clrps) > 0 {
+		t.Debugf("📜 Successfully applied %d CiliumLocalRedirectPolicies", len(t.clrps))
+	}
+
 	return nil
 }
 
 // deletePolicies deletes a given set of network policies from the cluster.
 func (t *Test) deletePolicies(ctx context.Context) error {
-	if len(t.cnps) == 0 && len(t.ccnps) == 0 && len(t.knps) == 0 && len(t.cegps) == 0 {
+	if len(t.cnps) == 0 && len(t.ccnps) == 0 && len(t.knps) == 0 && len(t.cegps) == 0 && len(t.clrps) == 0 {
 		return nil
 	}
+
+	policyApplyDeleteLock.Lock()
+	defer policyApplyDeleteLock.Unlock()
 
 	// Get current policy revisions in all Cilium pods.
 	revs, err := t.Context().getCiliumPolicyRevisions(ctx)
@@ -627,7 +567,17 @@ func (t *Test) deletePolicies(ctx context.Context) error {
 		}
 	}
 
-	if len(t.cnps) != 0 || len(t.ccnps) != 0 || len(t.knps) != 0 {
+	// Delete all the Test's CLRPs from all clients.
+	for _, clrp := range t.clrps {
+		t.Infof("📜 Deleting CiliumLocalRedirectPolicy '%s' from namespace '%s'..", clrp.Name, clrp.Namespace)
+		for _, client := range t.Context().clients.clients() {
+			if err := deleteCLRP(ctx, client, clrp); err != nil {
+				return fmt.Errorf("deleting CiliumLocalRedirectPolicy: %w", err)
+			}
+		}
+	}
+
+	if len(t.cnps) != 0 || len(t.ccnps) != 0 || len(t.knps) != 0 || len(t.clrps) != 0 {
 		// Wait for policies to be deleted on all Cilium nodes.
 		if err := t.waitCiliumPolicyRevisions(ctx, revs, revDeltas); err != nil {
 			return fmt.Errorf("timed out removing policies on Cilium agents: %w", err)
@@ -650,6 +600,10 @@ func (t *Test) deletePolicies(ctx context.Context) error {
 		t.Debugf("📜 Successfully deleted %d CiliumEgressGatewayPolicies", len(t.cegps))
 	}
 
+	if len(t.clrps) > 0 {
+		t.Debugf("📜 Successfully deleted %d CiliumLocalRedirectPolicies", len(t.clrps))
+	}
+
 	return nil
 }
 
@@ -657,7 +611,7 @@ func (t *Test) deletePolicies(ctx context.Context) error {
 // filter is applied on each line of output.
 func (t *Test) CiliumLogs(ctx context.Context) {
 	for _, pod := range t.Context().ciliumPods {
-		log, err := pod.K8sClient.CiliumLogs(ctx, pod.Pod.Namespace, pod.Pod.Name, t.startTime, nil)
+		log, err := pod.K8sClient.CiliumLogs(ctx, pod.Pod.Namespace, pod.Pod.Name, t.startTime)
 		if err != nil {
 			t.Fatalf("Error reading Cilium logs: %s", err)
 		}
@@ -713,4 +667,10 @@ func parseK8SPolicyYAML(policy string) (policies []*networkingv1.NetworkPolicy, 
 // CiliumEgressGatewayPolicies.
 func parseCiliumEgressGatewayPolicyYAML(policy string) (cegps []*ciliumv2.CiliumEgressGatewayPolicy, err error) {
 	return ParsePolicyYAML[*ciliumv2.CiliumEgressGatewayPolicy](policy, scheme.Scheme)
+}
+
+// parseCiliumLocalRedirectPolicyYAML decodes policy yaml into a slice of
+// CiliumLocalRedirectPolicies.
+func parseCiliumLocalRedirectPolicyYAML(policy string) (clrp []*ciliumv2.CiliumLocalRedirectPolicy, err error) {
+	return ParsePolicyYAML[*ciliumv2.CiliumLocalRedirectPolicy](policy, scheme.Scheme)
 }

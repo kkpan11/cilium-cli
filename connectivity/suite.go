@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
-// Package connectivity defines tests executed by the "cilium connectivity test"
-// command. Do not modify this package. It's being moved to cilium/cilium repo as
-// a part of https://github.com/cilium/design-cfps/pull/9.
 package connectivity
 
 import (
 	"context"
+	"errors"
 
 	"github.com/cilium/cilium-cli/connectivity/builder"
 	"github.com/cilium/cilium-cli/connectivity/check"
+	"github.com/cilium/cilium-cli/utils/runner"
 )
 
 // Hooks defines the extension hooks provided by connectivity tests.
@@ -20,17 +19,70 @@ type Hooks interface {
 	AddConnectivityTests(ct *check.ConnectivityTest) error
 }
 
-func Run(ctx context.Context, ct *check.ConnectivityTest, extra Hooks) error {
-	if err := ct.SetupAndValidate(ctx, extra); err != nil {
+func Run(ctx context.Context, connTests []*check.ConnectivityTest, extra Hooks) error {
+	if err := setupConnectivityTests(ctx, connTests, extra); err != nil {
 		return err
 	}
 
-	ct.Infof("Cilium version: %v", ct.CiliumVersion)
+	connTests[0].Infof("Cilium version: %v", connTests[0].CiliumVersion)
 
-	extraTests := func(ct *check.ConnectivityTest) error { return extra.AddConnectivityTests(ct) }
-	if err := builder.InjectTests(ct, extraTests); err != nil {
+	suiteBuilders, err := builder.GetTestSuites(connTests[0].Params())
+	if err != nil {
 		return err
 	}
+	for i := range suiteBuilders {
+		if e := suiteBuilders[i](connTests, extra.AddConnectivityTests); e != nil {
+			return e
+		}
+		for j := range connTests {
+			connTests[j].PrintTestInfo()
+		}
+		if e := runConnectivityTests(ctx, connTests); e != nil {
+			return e
+		}
+		for j := range connTests {
+			if e := connTests[j].PrintReport(ctx); e != nil {
+				err = errors.Join(err, e)
+			}
+			connTests[j].Cleanup()
+		}
+	}
+	return err
+}
 
-	return ct.Run(ctx)
+func setupConnectivityTests(ctx context.Context, connTest []*check.ConnectivityTest, hooks Hooks) error {
+	me := runner.MultiError{}
+	for i := range connTest {
+		id := i
+		me.Go(func() error {
+			return connTest[id].SetupAndValidate(ctx, hooks)
+		})
+	}
+	return me.Wait()
+}
+
+func runConnectivityTests(ctx context.Context, connTests []*check.ConnectivityTest) error {
+	finish := make([]bool, len(connTests))
+	me := runner.MultiError{}
+	for i := range connTests {
+		id := i
+		// Execute connectivity.Run() in its own goroutine, it might call Fatal()
+		// and end the goroutine without returning.
+		me.Go(func() error {
+			err := connTests[id].Run(ctx)
+			// If Fatal() was called in the test suite, the statement below won't fire.
+			finish[id] = true
+			return err
+		})
+	}
+	if err := me.Wait(); err != nil {
+		return err
+	}
+	for i := 0; i < len(connTests); i++ {
+		if !finish[i] {
+			// Exit with a non-zero return code.
+			return errors.New("encountered internal error, exiting")
+		}
+	}
+	return nil
 }

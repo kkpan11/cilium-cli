@@ -4,15 +4,16 @@
 package k8s
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/cli/output"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -30,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/resource"
@@ -39,6 +42,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth" // Register all auth providers (azure, gcp, oidc, openstack, ..).
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/transport/spdy"
 
 	"github.com/cilium/cilium/api/v1/models"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -281,7 +285,6 @@ func (c *Client) GetRaw(ctx context.Context, path string) (string, error) {
 		return "", err
 	}
 	return string(response), nil
-
 }
 
 func (c *Client) CreatePod(ctx context.Context, namespace string, pod *corev1.Pod, opts metav1.CreateOptions) (*corev1.Pod, error) {
@@ -304,12 +307,7 @@ func (c *Client) PodLogs(namespace, name string, opts *corev1.PodLogOptions) *re
 	return c.Clientset.CoreV1().Pods(namespace).GetLogs(name, opts)
 }
 
-// separator for locating the start of the next log message. Sometimes
-// logs may span multiple lines, locate the timestamp, log level and
-// msg that always start a new log message
-var logSplitter = regexp.MustCompile(`\r?\n[^ ]+ level=[[:alpha:]]+ msg=`)
-
-func (c *Client) CiliumLogs(ctx context.Context, namespace, pod string, since time.Time, filter *regexp.Regexp) (string, error) {
+func (c *Client) CiliumLogs(ctx context.Context, namespace, pod string, since time.Time) (string, error) {
 	opts := &corev1.PodLogOptions{
 		Container:  defaults.AgentContainerName,
 		Timestamps: true,
@@ -322,37 +320,12 @@ func (c *Client) CiliumLogs(ctx context.Context, namespace, pod string, since ti
 	}
 	defer podLogs.Close()
 
-	buf := new(bytes.Buffer)
-	scanner := bufio.NewScanner(podLogs)
-	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
-		if atEOF && len(data) == 0 {
-			return 0, nil, nil
-		}
-		// find the full log line separator
-		loc := logSplitter.FindIndex(data)
-		if loc != nil {
-			// Locate '\n', advance just past it
-			nl := loc[0] + bytes.IndexByte(data[loc[0]:loc[1]], '\n') + 1
-			return nl, data[:nl], nil
-		} else if atEOF {
-			// EOF, return all we have
-			return len(data), data, nil
-		}
-		// Nothing to return
-		return 0, nil, nil
-	})
-
-	for scanner.Scan() {
-		if filter != nil && !filter.Match(scanner.Bytes()) {
-			continue
-		}
-		buf.Write(scanner.Bytes())
-	}
-	err = scanner.Err()
+	log, err := io.ReadAll(podLogs)
 	if err != nil {
-		err = fmt.Errorf("error reading cilium-agent logs for %s/%s: %w", namespace, pod, err)
+		return "", fmt.Errorf("error reading log: %w", err)
 	}
-	return buf.String(), err
+
+	return string(log), nil
 }
 
 func (c *Client) ListServices(ctx context.Context, namespace string, options metav1.ListOptions) (*corev1.ServiceList, error) {
@@ -418,6 +391,35 @@ func (c *Client) CiliumStatus(ctx context.Context, namespace, pod string) (*mode
 	}
 
 	return &statusResponse, nil
+}
+
+// KVStoreMeshStatusNotImplemented is a sentinel error to signal that the status command is not implemented.
+var ErrKVStoreMeshStatusNotImplemented = errors.New("kvstoremesh-dbg status is not available")
+
+func (c *Client) KVStoreMeshStatus(ctx context.Context, namespace, pod string) ([]*models.RemoteCluster, error) {
+	stdout, stderr, err := c.ExecInPodWithStderr(ctx, namespace, pod, defaults.ClusterMeshKVStoreMeshContainerName,
+		[]string{defaults.ClusterMeshBinaryName, "kvstoremesh-dbg", "status", "-o", "json"})
+	if err != nil {
+		// Cilium v1.14 has a separate kvstoremesh container, with a separate binary
+		if strings.Contains(err.Error(), "stat /usr/bin/clustermesh-apiserver: no such file or directory") {
+			return nil, ErrKVStoreMeshStatusNotImplemented
+		}
+
+		// Try to figure out if the status command is not yet supported in this version
+		stderrStr := stderr.String()
+		if strings.Contains(stderrStr, "Usage:") || strings.Contains(stderrStr, "unknown command") {
+			return nil, ErrKVStoreMeshStatusNotImplemented
+		}
+
+		return nil, err
+	}
+
+	statusResponse := make([]*models.RemoteCluster, 0)
+	if err := json.Unmarshal(stdout.Bytes(), &statusResponse); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal response of kvstoremesh-dbg status: %w", err)
+	}
+
+	return statusResponse, nil
 }
 
 func (c *Client) CiliumDbgEndpoints(ctx context.Context, namespace, pod string) ([]*models.Endpoint, error) {
@@ -489,6 +491,10 @@ func (c *Client) CheckDaemonSetStatus(ctx context.Context, namespace, deployment
 
 func (c *Client) GetStatefulSet(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*appsv1.StatefulSet, error) {
 	return c.Clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, opts)
+}
+
+func (c *Client) GetCronJob(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*batchv1.CronJob, error) {
+	return c.Clientset.BatchV1().CronJobs(namespace).Get(ctx, name, opts)
 }
 
 func (c *Client) GetCRD(ctx context.Context, name string, opts metav1.GetOptions) (*apiextensions.CustomResourceDefinition, error) {
@@ -584,7 +590,6 @@ func (c *Client) AutodetectFlavor(ctx context.Context) Flavor {
 	// When creating a cluster with eksctl create cluster --name foo,
 	// the cluster name is foo.<region>.eksctl.io
 	if strings.HasSuffix(c.ClusterName(), ".eksctl.io") {
-		f.ClusterName = strings.ReplaceAll(c.ClusterName(), ".", "-")
 		f.Kind = KindEKS
 		return f
 	}
@@ -680,6 +685,10 @@ func (c *Client) DeleteCiliumEgressGatewayPolicy(ctx context.Context, name strin
 	return c.CiliumClientset.CiliumV2().CiliumEgressGatewayPolicies().Delete(ctx, name, opts)
 }
 
+func (c *Client) DeleteCiliumLocalRedirectPolicy(ctx context.Context, namespace, name string, opts metav1.DeleteOptions) error {
+	return c.CiliumClientset.CiliumV2().CiliumLocalRedirectPolicies(namespace).Delete(ctx, name, opts)
+}
+
 func (c *Client) ListCiliumBGPPeeringPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPPeeringPolicyList, error) {
 	return c.CiliumClientset.CiliumV2alpha1().CiliumBGPPeeringPolicies().List(ctx, opts)
 }
@@ -761,6 +770,94 @@ func (c *Client) ProxyGet(ctx context.Context, namespace, name, url string) (str
 		return "", err
 	}
 	return string(rawbody), nil
+}
+
+func (c *Client) ProxyTCP(ctx context.Context, namespace, name string, port uint16, handler func(io.ReadWriteCloser) error) error {
+	request := c.Clientset.CoreV1().RESTClient().Post().
+		Resource(corev1.ResourcePods.String()).
+		Namespace(namespace).
+		Name(name).
+		SubResource("portforward")
+
+	transport, upgrader, err := spdy.RoundTripperFor(c.Config)
+	if err != nil {
+		return fmt.Errorf("creating round tripper: %w", err)
+	}
+
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, request.URL())
+
+	const portForwardProtocolV1Name = "portforward.k8s.io"
+	conn, proto, err := dialer.Dial(portForwardProtocolV1Name)
+	if err != nil {
+		return fmt.Errorf("connecting: %w", err)
+	}
+
+	defer conn.Close()
+	if proto != portForwardProtocolV1Name {
+		return fmt.Errorf("unable to negotiate protocol: client supports %q, server returned %q", portForwardProtocolV1Name, proto)
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Close aborts all remaining streams, and unblocks read operations.
+			conn.Close()
+		case <-conn.CloseChan():
+		}
+	}()
+
+	return stream(conn, port, handler)
+}
+
+// The following is an adapted version of part of the client-go's port-forward connection handling implementation:
+// https://github.com/kubernetes/client-go/blob/4ebe42d8c9c18f464fcc7b4f15b3a632db4cbdb2/tools/portforward/portforward.go#L335-L416
+func stream(conn httpstream.Connection, port uint16, handler func(io.ReadWriteCloser) error) error {
+	headers := http.Header{}
+	headers.Set(corev1.StreamType, corev1.StreamTypeError)
+	headers.Set(corev1.PortHeader, strconv.FormatUint(uint64(port), 10))
+
+	errorStream, err := conn.CreateStream(headers)
+	if err != nil {
+		return fmt.Errorf("creating error stream: %w", err)
+	}
+	// we're not writing to this stream
+	errorStream.Close()
+	defer conn.RemoveStreams(errorStream)
+
+	errorDone := make(chan error)
+	go func() {
+		defer close(errorDone)
+		message, err := io.ReadAll(errorStream)
+		switch {
+		case err != nil:
+			errorDone <- fmt.Errorf("reading from error stream: %w", err)
+		case len(message) > 0:
+			errorDone <- errors.New(string(message))
+		}
+	}()
+
+	headers.Set(corev1.StreamType, corev1.StreamTypeData)
+	dataStream, err := conn.CreateStream(headers)
+	if err != nil {
+		return fmt.Errorf("creating data stream: %w", err)
+	}
+	defer conn.RemoveStreams(dataStream)
+
+	dataDone := make(chan error)
+	go func() {
+		defer close(dataDone)
+		if err := handler(dataStream); err != nil {
+			dataDone <- err
+		}
+	}()
+
+	// Wait for both goroutines to terminate
+	err = <-dataDone
+	if err2 := <-errorDone; err2 != nil {
+		err = err2
+	}
+
+	return err
 }
 
 func (c *Client) ListUnstructured(ctx context.Context, gvr schema.GroupVersionResource, namespace *string, o metav1.ListOptions) (*unstructured.UnstructuredList, error) {
@@ -911,7 +1008,31 @@ func (c *Client) GetHelmValues(_ context.Context, releaseName string, namespace 
 		return "", fmt.Errorf("unable to parse helm values from release %s: %w", releaseName, err)
 	}
 	return valuesBuf.String(), nil
+}
 
+// GetHelmMetadata is the function for cilium cli sysdump to collect the helm metadata from the release directly
+func (c *Client) GetHelmMetadata(_ context.Context, releaseName string, namespace string) (string, error) {
+	if c.RESTClientGetter == nil {
+		return "", fmt.Errorf("no RESTClientGetter for Helm Values")
+	}
+	helmDriver := ""
+	actionConfig := action.Configuration{}
+	logger := func(_ string, _ ...interface{}) {}
+	if err := actionConfig.Init(c.RESTClientGetter, namespace, helmDriver, logger); err != nil {
+		return "", err
+	}
+
+	client := action.NewGetMetadata(&actionConfig)
+	meta, err := client.Run(releaseName)
+	if err != nil {
+		return "", fmt.Errorf("unable to retrieve helm meta from release %s: %w", releaseName, err)
+	}
+
+	buf := new(bytes.Buffer)
+	if err = output.EncodeYAML(buf, meta); err != nil {
+		return "", fmt.Errorf("unable to parse helm metas from release %s: %w", releaseName, err)
+	}
+	return buf.String(), nil
 }
 
 // CreateEphemeralContainer will create a EphemeralContainer (debug container) in the specified pod.

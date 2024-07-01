@@ -56,8 +56,9 @@ const (
 	// TemplatesDir is the default path for the compiled template objects relative to StateDir
 	TemplatesDir = "templates"
 
-	// TemplatePath is the default path for a symlink to a template relative to StateDir/<EPID>
-	TemplatePath = "template.o"
+	// TemplateIDPath is the name of a file which contains the ID (aka hash) of
+	// the template used by the endpoint.
+	TemplateIDPath = "template.txt"
 
 	// BpfDir is the default path for template files relative to LibDir
 	BpfDir = "bpf"
@@ -180,13 +181,25 @@ const (
 	// DNSProxyEnableTransparentMode enables transparent mode for the DNS proxy.
 	DNSProxyEnableTransparentMode = false
 
+	// DNSProxyLockCount is the default array size containing mutexes which protect
+	// against parallel handling of DNS response names.
+	DNSProxyLockCount = 131
+
+	// DNSProxyLockTimeout is the default timeout when acquiring the locks controlled by
+	// DNSProxyLockCount.
+	DNSProxyLockTimeout = 500 * time.Millisecond
+
 	// IdentityChangeGracePeriod is the default value for
 	// option.IdentityChangeGracePeriod
 	IdentityChangeGracePeriod = 5 * time.Second
 
-	// IdentityRestoreGracePeriod is the default value for
-	// option.IdentityRestoreGracePeriod
-	IdentityRestoreGracePeriod = 10 * time.Minute
+	// IdentityRestoreGracePeriodKvstore is the default value for
+	// option.IdentityRestoreGracePeriod when kvstore is enabled.
+	IdentityRestoreGracePeriodKvstore = 10 * time.Minute
+
+	// IdentityRestoreGracePeriodKvstore is the default value for
+	// option.IdentityRestoreGracePeriod when only k8s is in use
+	IdentityRestoreGracePeriodK8s = 30 * time.Second
 
 	// ExecTimeout is a timeout for executing commands.
 	ExecTimeout = 300 * time.Second
@@ -227,9 +240,6 @@ const (
 	// EnableL7Proxy is the default value for L7 proxy enablement
 	EnableL7Proxy = true
 
-	// EnvoyConfigTimeout determines how long to wait Envoy to N/ACK resources
-	EnvoyConfigTimeout = 2 * time.Minute
-
 	// EnableHostLegacyRouting is the default value for using the old routing path via stack.
 	EnableHostLegacyRouting = false
 
@@ -246,6 +256,15 @@ const (
 	// Enable watcher for IPsec key. If disabled, a restart of the agent will
 	// be necessary on key rotations.
 	EnableIPsecKeyWatcher = true
+
+	// Enable caching for XfrmState for IPSec. Significantly reduces CPU usage
+	// in large clusters.
+	EnableIPSecXfrmStateCaching = true
+
+	// Enable IPSec encrypted overlay
+	//
+	// This feature will encrypt overlay traffic before it leaves the cluster.
+	EnableIPSecEncryptedOverlay = false
 
 	// EncryptNode enables encrypting traffic from host networking applications
 	// which are not part of Cilium manged pods.
@@ -286,6 +305,9 @@ const (
 	// EnableAutoDirectRouting is the default value for EnableAutoDirectRouting
 	EnableAutoDirectRouting = false
 
+	// EnableDirectRoutingSkipUnreachable is the default value for EnableDirectRoutingIgnoreUnreachableName
+	EnableDirectRoutingSkipUnreachable = false
+
 	// EnableHealthChecking is the default value for EnableHealthChecking
 	EnableHealthChecking = true
 
@@ -313,9 +335,6 @@ const (
 	// KVStoreStaleLockTimeout is the timeout for when a lock is held for
 	// a kvstore path for too long.
 	KVStoreStaleLockTimeout = 30 * time.Second
-
-	// IPAllocationTimeout is the timeout when allocating CIDRs
-	IPAllocationTimeout = 2 * time.Minute
 
 	// PolicyQueueSize is the default queue size for policy-related events.
 	PolicyQueueSize = 100
@@ -442,11 +461,11 @@ const (
 	// policy updates are invoked.
 	PolicyTriggerInterval = 1 * time.Second
 
-	// K8sClientQPSLimit is the default qps for the k8s client. It is set to 0 because the the k8s client
+	// K8sClientQPSLimit is the default qps for the k8s client. It is set to 0 because the k8s client
 	// has its own default.
 	K8sClientQPSLimit float32 = 0.0
 
-	// K8sClientBurst is the default burst for the k8s client. It is set to 0 because the the k8s client
+	// K8sClientBurst is the default burst for the k8s client. It is set to 0 because the k8s client
 	// has its own default.
 	K8sClientBurst = 0
 
@@ -472,9 +491,6 @@ const (
 	// CertsDirectory is the default directory used to find certificates
 	// specified in the L7 policies.
 	CertsDirectory = RuntimePath + "/certs"
-
-	// EnableRemoteNodeIdentity is the default value for option.EnableRemoteNodeIdentity
-	EnableRemoteNodeIdentity = true
 
 	// IPAMExpiration is the timeout after which an IP subject to expiratio
 	// is being released again if no endpoint is being created in time.
@@ -512,11 +528,9 @@ const (
 	// InstallNoConntrackRules instructs Cilium to install Iptables rules to skip netfilter connection tracking on all pod traffic.
 	InstallNoConntrackIptRules = false
 
-	// WireguardSubnetV4 is a default WireGuard tunnel subnet
-	WireguardSubnetV4 = "172.16.43.0/24"
-
-	// WireguardSubnetV6 is a default WireGuard tunnel subnet
-	WireguardSubnetV6 = "fdc9:281f:04d7:9ee9::1/64"
+	// ContainerIPLocalReservedPortsAuto instructs the Cilium CNI plugin to reserve
+	// an auto-generated list of ports in the container network namespace
+	ContainerIPLocalReservedPortsAuto = "auto"
 
 	// ExternalClusterIP enables cluster external access to ClusterIP services.
 	// Defaults to false to retain prior behaviour of not routing external packets to ClusterIPs.
@@ -564,6 +578,18 @@ const (
 
 	// EnableNodeSelectorLabels is the default value for option.EnableNodeSelectorLabels
 	EnableNodeSelectorLabels = false
+
+	// BPFEventsDropEnabled controls whether the Cilium datapath exposes "drop" events to Cilium monitor and Hubble.
+	BPFEventsDropEnabled = true
+
+	// BPFEventsPolicyVerdictEnabled controls whether the Cilium datapath exposes "policy verdict" events to Cilium monitor and Hubble.
+	BPFEventsPolicyVerdictEnabled = true
+
+	// BPFEventsTraceEnabled controls whether the Cilium datapath exposes "trace" events to Cilium monitor and Hubble.
+	BPFEventsTraceEnabled = true
+
+	// EnableEnvoyConfig is the default value for option.EnableEnvoyConfig
+	EnableEnvoyConfig = false
 )
 
 var (

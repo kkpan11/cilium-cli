@@ -11,8 +11,16 @@ import (
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/node"
+	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 )
+
+// NodeNeighborEnqueuer provides an interface for clients to push node updates
+// for further processing.
+type NodeNeighborEnqueuer interface {
+	// Enqueue enqueues a node for processing node neighbors updates.
+	Enqueue(*nodeTypes.Node, bool)
+}
 
 // DeviceConfiguration is an interface for injecting configuration of datapath
 // options that affect lookups and logic applied at a per-device level, whether
@@ -40,6 +48,7 @@ type LoadTimeConfiguration interface {
 	IPv4Address() netip.Addr
 	IPv6Address() netip.Addr
 	GetNodeMAC() mac.MAC
+	GetIfIndex() int
 }
 
 // CompileTimeConfiguration provides datapath implementations a clean interface
@@ -94,15 +103,15 @@ type ConfigWriter interface {
 	// of configurable options to the specified writer. Options specified
 	// here will apply to base programs and not to endpoints, though
 	// endpoints may have equivalent configurable options.
-	WriteNetdevConfig(io.Writer, DeviceConfiguration) error
+	WriteNetdevConfig(io.Writer, *option.IntOptions) error
 
 	// WriteTemplateConfig writes the implementation-specific configuration
 	// of configurable options for BPF templates to the specified writer.
-	WriteTemplateConfig(w io.Writer, cfg EndpointConfiguration) error
+	WriteTemplateConfig(w io.Writer, nodeCfg *LocalNodeConfiguration, cfg EndpointConfiguration) error
 
 	// WriteEndpointConfig writes the implementation-specific configuration
 	// of configurable options for the endpoint to the specified writer.
-	WriteEndpointConfig(w io.Writer, cfg EndpointConfiguration) error
+	WriteEndpointConfig(w io.Writer, nodeCfg *LocalNodeConfiguration, cfg EndpointConfiguration) error
 }
 
 // RemoteSNATDstAddrExclusionCIDRv4 returns a CIDR for SNAT exclusion. Any

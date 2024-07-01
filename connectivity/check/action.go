@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	hubprinter "github.com/cilium/hubble/pkg/printer"
+	hubprinter "github.com/cilium/cilium/hubble/pkg/printer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -146,6 +146,11 @@ func (a *Action) IPFamily() features.IPFamily {
 	return a.ipFam
 }
 
+// Scenario returns the scenario the Action belongs to.
+func (a *Action) Scenario() Scenario {
+	return a.scenario
+}
+
 // Run executes function f.
 //
 // This method is to be called from a Scenario implementation.
@@ -153,7 +158,7 @@ func (a *Action) Run(f func(*Action)) {
 	a.Logf("[.] Action [%s]", a)
 
 	// Emit unbuffered progress indicator.
-	a.test.progress()
+	a.test.ctx.logger.Printf(a.test, ".")
 
 	// Retrieve Prometheus metrics only if there are expectations.
 	for _, m := range a.expIngress.Metrics {
@@ -279,6 +284,7 @@ func (a *Action) ExecInPod(ctx context.Context, cmd []string) {
 	cmdStr := strings.Join(cmd, " ")
 
 	var output bytes.Buffer
+	var errOutput bytes.Buffer
 	var err error
 	// We retry the command in case of inconclusive results. The result is
 	// deemed inconclusive when the command succeeded, but we don't have any
@@ -289,7 +295,7 @@ func (a *Action) ExecInPod(ctx context.Context, cmd []string) {
 	// This check currently only works because all our test commands expect an
 	// output.
 	for i := 1; i <= testCommandRetries; i++ {
-		output, err = pod.K8sClient.ExecInPod(ctx,
+		output, errOutput, err = pod.K8sClient.ExecInPodWithStderr(ctx,
 			pod.Pod.Namespace, pod.Pod.Name, pod.Pod.Labels["name"], cmd)
 		a.cmdOutput = output.String()
 		// Check for inconclusive results.
@@ -330,8 +336,10 @@ func (a *Action) ExecInPod(ctx context.Context, cmd []string) {
 		}
 	}
 	if showOutput {
-		a.test.Infof("%s output:", cmdName)
+		a.test.Infof("%s stdout:", cmdName)
 		a.test.Log(strings.TrimSpace(output.String()))
+		a.test.Infof("%s stderr:", cmdName)
+		a.test.Log(strings.TrimSpace(errOutput.String()))
 		a.test.Log()
 	}
 }
@@ -1062,7 +1070,7 @@ func (a *Action) validateMetric(ctx context.Context, node string, result Metrics
 		select {
 		case <-ctx.Done():
 			// Context timeout is reached, let's exit.
-			a.Failf("failed to collect metrics on node %s, context timeout: %s\n", node, ctx.Err())
+			a.Failf("failed to collect metrics on node %s. context timeout: %q, last error: %s\n", node, ctx.Err(), err)
 			return
 		case <-ticker.C:
 			// Ticker is delivered, let's retry.

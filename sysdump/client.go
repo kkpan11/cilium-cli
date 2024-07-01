@@ -6,11 +6,13 @@ package sysdump
 import (
 	"bytes"
 	"context"
+	"io"
 
 	"github.com/blang/semver/v4"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	ciliumv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,12 +37,15 @@ type KubernetesClient interface {
 	GetDaemonSet(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*appsv1.DaemonSet, error)
 	GetStatefulSet(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*appsv1.StatefulSet, error)
 	GetDeployment(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*appsv1.Deployment, error)
+	GetCronJob(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*batchv1.CronJob, error)
 	GetLogs(ctx context.Context, namespace, name, container string, opts corev1.PodLogOptions) (string, error)
 	GetPodsTable(ctx context.Context) (*metav1.Table, error)
 	ProxyGet(ctx context.Context, namespace, name, url string) (string, error)
+	ProxyTCP(ctx context.Context, namespace, name string, port uint16, handler func(io.ReadWriteCloser) error) error
 	GetSecret(ctx context.Context, namespace, name string, opts metav1.GetOptions) (*corev1.Secret, error)
 	GetCiliumVersion(ctx context.Context, p *corev1.Pod) (*semver.Version, error)
 	GetVersion(ctx context.Context) (string, error)
+	GetHelmMetadata(ctx context.Context, releaseName string, namespace string) (string, error)
 	GetHelmValues(ctx context.Context, releaseName string, namespace string) (string, error)
 	ListCiliumBGPPeeringPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPPeeringPolicyList, error)
 	ListCiliumCIDRGroups(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumCIDRGroupList, error)
